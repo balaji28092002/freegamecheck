@@ -1,4 +1,4 @@
-name: Check Epic Free Games
+name: Check Free Games
 
 on:
   schedule:
