@@ -16,6 +16,9 @@ try:
 except ImportError:
     pass
 
+import db
+
+
 EPIC_API_URL = (
     "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
     "?locale=en-US&country=IN&allowCountry=IN"
@@ -63,20 +66,9 @@ query OffersContext_Offers_And_Items($dateOverride: Time, $pageSize: Int) {
 }
 """
 
-STATE_FILE = Path(__file__).parent / "state.json"
-STATE_LUNA_FILE = Path(__file__).parent / "state_luna.json"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-
-def load_state(path: Path) -> list[dict]:
-    if path.exists():
-        return json.loads(path.read_text())
-    return []
-
-
-def save_state(path: Path, state: list[dict]) -> None:
-    path.write_text(json.dumps(state, indent=2) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +350,11 @@ def _send_alert(message: str) -> None:
         pass
 
 
-def check_source(name: str, fetch_fn, send_fn, state_path: Path) -> int:
+def check_source(name: str, fetch_fn, send_fn, platform: str) -> int:
     print(f"\n[{datetime.now().isoformat()}] Checking {name} free games…")
 
-    known = load_state(state_path)
-    known_ids = {g["id"] for g in known}
-    print(f"  Known games: {[g['title'] for g in known]}")
+    known_ids = db.load_known_game_ids(platform)
+    print(f"  [DB] Known {name} games count: {len(known_ids)}")
 
     try:
         current = fetch_fn()
@@ -399,15 +390,30 @@ def check_source(name: str, fetch_fn, send_fn, state_path: Path) -> int:
     else:
         print("  No new free games found.")
 
-    save_state(state_path, current)
+    db.save_games(platform, current)
+    print(f"  [DB] Saved active {name} games to database.")
+
     return notified
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
+    if not db.is_db_enabled():
+        err_msg = "NeonDB is not configured or DATABASE_URL environment variable is missing."
+        print(f"❌ {err_msg}", file=sys.stderr)
+        _send_alert(f"<b>NeonDB Not Configured</b>\n\n{err_msg}\nPlease set <code>DATABASE_URL</code> in environment / GitHub Secrets.")
+        return 1
+
     total = 0
-    total += check_source("Epic Games", get_epic_free_games, send_telegram_epic, STATE_FILE)
-    total += check_source("Amazon Luna", get_luna_free_games, send_telegram_luna, STATE_LUNA_FILE)
+    total += check_source("Epic Games", get_epic_free_games, send_telegram_epic, "epic")
+    total += check_source("Amazon Luna", get_luna_free_games, send_telegram_luna, "luna")
     return 0
+
+
 
 
 if __name__ == "__main__":
