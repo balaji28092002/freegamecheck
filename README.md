@@ -1,6 +1,6 @@
-# Epic Free Games Telegram Bot
+# Free Games Telegram Bot (Epic Games, Amazon Luna, itch.io & STOVE Store)
 
-Checks Epic Games Store daily for new free games and sends a Telegram notification.
+Checks Epic Games Store, Amazon Luna, itch.io, and STOVE Store daily for 100% off / free games and sends Telegram notifications.
 
 ## Setup
 
@@ -17,7 +17,7 @@ Checks Epic Games Store daily for new free games and sends a Telegram notificati
 
 ## Files
 
-- `check_games.py` — The checker script
+- `check_games.py` — Main checker script (Epic Games, Amazon Luna, itch.io, STOVE Store)
+- `db.py` — Neon PostgreSQL database tracking layer
 - `.github/workflows/check.yml` — GitHub Actions workflow
-- `state.json` — Tracks previously seen games (only new ones trigger notifications)
 - `requirements.txt` — Python dependencies
