@@ -33,6 +33,27 @@ CREATE TABLE IF NOT EXISTS tracked_games (
 CREATE INDEX IF NOT EXISTS idx_tracked_games_platform ON tracked_games(platform);
 """
 
+CREATE_DEALS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tracked_deals (
+    id VARCHAR(255) PRIMARY KEY,
+    platform VARCHAR(50) NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    claim_url TEXT,
+    thumbnail TEXT,
+    original_price VARCHAR(100),
+    discounted_price VARCHAR(100),
+    discount_pct VARCHAR(20),
+    currency VARCHAR(20),
+    expiry TIMESTAMP WITH TIME ZONE,
+    raw_data JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracked_deals_platform ON tracked_deals(platform);
+"""
+
 UPSERT_GAME_SQL = """
 INSERT INTO tracked_games (
     id, platform, title, description, claim_url, thumbnail,
@@ -47,6 +68,28 @@ ON CONFLICT (id) DO UPDATE SET
     claim_url = EXCLUDED.claim_url,
     thumbnail = EXCLUDED.thumbnail,
     original_price = EXCLUDED.original_price,
+    currency = EXCLUDED.currency,
+    expiry = EXCLUDED.expiry,
+    raw_data = EXCLUDED.raw_data,
+    updated_at = CURRENT_TIMESTAMP;
+"""
+
+UPSERT_DEAL_SQL = """
+INSERT INTO tracked_deals (
+    id, platform, title, description, claim_url, thumbnail,
+    original_price, discounted_price, discount_pct, currency, expiry, raw_data, updated_at
+) VALUES (
+    %(id)s, %(platform)s, %(title)s, %(description)s, %(claim_url)s, %(thumbnail)s,
+    %(original_price)s, %(discounted_price)s, %(discount_pct)s, %(currency)s, %(expiry)s, %(raw_data)s, CURRENT_TIMESTAMP
+)
+ON CONFLICT (id) DO UPDATE SET
+    title = EXCLUDED.title,
+    description = EXCLUDED.description,
+    claim_url = EXCLUDED.claim_url,
+    thumbnail = EXCLUDED.thumbnail,
+    original_price = EXCLUDED.original_price,
+    discounted_price = EXCLUDED.discounted_price,
+    discount_pct = EXCLUDED.discount_pct,
     currency = EXCLUDED.currency,
     expiry = EXCLUDED.expiry,
     raw_data = EXCLUDED.raw_data,
@@ -73,7 +116,7 @@ def get_connection():
 
 
 def init_db() -> None:
-    """Create tracked_games table and index if they do not exist."""
+    """Create tracked_games and tracked_deals tables and indexes if they do not exist."""
     if not is_db_enabled():
         return
 
@@ -81,13 +124,14 @@ def init_db() -> None:
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(CREATE_TABLE_SQL)
+                cur.execute(CREATE_DEALS_TABLE_SQL)
             conn.commit()
     except Exception as e:
         print(f"  ⚠️ Failed to initialize database: {e}", file=sys.stderr)
 
 
 def load_known_game_ids(platform: str) -> set[str]:
-    """Fetch set of known game IDs from DB for given platform ('epic' or 'luna')."""
+    """Fetch set of known game IDs from DB for given platform ('epic', 'luna', 'itch', 'stove', 'steam')."""
     if not is_db_enabled():
         return set()
 
@@ -102,8 +146,24 @@ def load_known_game_ids(platform: str) -> set[str]:
         return set()
 
 
+def load_known_deal_ids(platform: str) -> set[str]:
+    """Fetch set of known deal IDs from tracked_deals table for given platform."""
+    if not is_db_enabled():
+        return set()
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM tracked_deals WHERE platform = %s;", (platform,))
+                rows = cur.fetchall()
+                return {row[0] for row in rows}
+    except Exception as e:
+        print(f"  ⚠️ Failed to query known deal IDs from DB: {e}", file=sys.stderr)
+        return set()
+
+
 def _prepare_game_params(platform: str, game: dict[str, Any]) -> dict[str, Any]:
-    """Helper to convert game dictionary into DB parameter map."""
+    """Helper to convert game dictionary into DB parameter map for tracked_games."""
     raw_expiry = game.get("expiry")
     expiry_dt: Optional[datetime] = None
     if raw_expiry:
@@ -112,7 +172,6 @@ def _prepare_game_params(platform: str, game: dict[str, Any]) -> dict[str, Any]:
         except (ValueError, TypeError):
             expiry_dt = None
 
-    # Derive thumbnail and claim_url if epic
     thumbnail = game.get("thumbnail", "")
     claim_url = game.get("claim_url", "")
     if platform == "epic":
@@ -146,8 +205,34 @@ def _prepare_game_params(platform: str, game: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _prepare_deal_params(platform: str, deal: dict[str, Any]) -> dict[str, Any]:
+    """Helper to convert deal dictionary into DB parameter map for tracked_deals."""
+    raw_expiry = deal.get("expiry")
+    expiry_dt: Optional[datetime] = None
+    if raw_expiry:
+        try:
+            expiry_dt = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            expiry_dt = None
+
+    return {
+        "id": deal["id"],
+        "platform": platform,
+        "title": deal.get("title", "Unknown Game"),
+        "description": deal.get("description", ""),
+        "claim_url": deal.get("claim_url", ""),
+        "thumbnail": deal.get("thumbnail", ""),
+        "original_price": deal.get("original_price", ""),
+        "discounted_price": deal.get("discounted_price", ""),
+        "discount_pct": deal.get("discount_pct", ""),
+        "currency": deal.get("currency", ""),
+        "expiry": expiry_dt,
+        "raw_data": Json(deal),
+    }
+
+
 def save_games(platform: str, games: list[dict[str, Any]]) -> None:
-    """Save or update games in the DB."""
+    """Save or update free games in tracked_games DB table."""
     if not is_db_enabled() or not games:
         return
 
@@ -162,3 +247,22 @@ def save_games(platform: str, games: list[dict[str, Any]]) -> None:
             conn.commit()
     except Exception as e:
         print(f"  ⚠️ Failed to save games to DB: {e}", file=sys.stderr)
+
+
+def save_deals(platform: str, deals: list[dict[str, Any]]) -> None:
+    """Save or update 90%+ discount deals in tracked_deals DB table."""
+    if not is_db_enabled() or not deals:
+        return
+
+    init_db()
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                for deal in deals:
+                    params = _prepare_deal_params(platform, deal)
+                    cur.execute(UPSERT_DEAL_SQL, params)
+            conn.commit()
+    except Exception as e:
+        print(f"  ⚠️ Failed to save deals to DB: {e}", file=sys.stderr)
+
