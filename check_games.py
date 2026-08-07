@@ -55,6 +55,7 @@ STEAM_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
+LENOVO_KEY_DROPS_URL = "https://gaming.lenovo.com/game-key-drops"
 LUNA_GRAPHQL_QUERY = """
 query OffersContext_Offers_And_Items($dateOverride: Time, $pageSize: Int) {
   games: items(collectionType: FREE_GAMES, dateOverride: $dateOverride, pageSize: $pageSize) {
@@ -583,8 +584,9 @@ def get_steam_discount_deals() -> list[dict] | None:
             except Exception:
                 pass
 
+            month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
             deals.append({
-                "id": f"steam_deal_{appid}",
+                "id": f"steam_deal_{month_prefix}_{appid}",
                 "title": title,
                 "description": description,
                 "claim_url": claim_url,
@@ -724,8 +726,9 @@ def get_epic_discount_deals(max_pages: int = 5) -> list[dict] | None:
                     if thumbnail:
                         break
 
+                month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
                 deals.append({
-                    "id": f"epic_deal_{game_id}",
+                    "id": f"epic_deal_{month_prefix}_{game_id}",
                     "title": title,
                     "description": description,
                     "claim_url": claim_url,
@@ -744,6 +747,62 @@ def get_epic_discount_deals(max_pages: int = 5) -> list[dict] | None:
             break
 
     return deals
+
+
+# ---------------------------------------------------------------------------
+# Lenovo Legion Key Drops
+# ---------------------------------------------------------------------------
+
+def get_lenovo_key_drops() -> list[dict] | None:
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        print("  ⚠️ curl_cffi package not installed, skipping Lenovo key drops", file=sys.stderr)
+        return []
+
+    try:
+        resp = cffi_requests.get(LENOVO_KEY_DROPS_URL, impersonate="chrome120", timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  ⚠️ Failed to fetch Lenovo Key Drops page: {e}", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    drops = []
+    seen_ids = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/post/" in href or "key-drop" in href:
+            title = a.text.strip()
+            if not title or title.lower() in ("learn more", "claim now", "coming soon", "view details"):
+                slug = href.split("/post/")[-1] if "/post/" in href else href.strip("/").split("/")[-1]
+                clean_slug = re.sub(r"-[a-zA-Z0-9]{10,}$", "", slug)
+                title = clean_slug.replace("-", " ").title()
+
+            drop_id_str = href.strip("/").split("/")[-1]
+            if not drop_id_str or drop_id_str in seen_ids:
+                continue
+            seen_ids.add(drop_id_str)
+
+            claim_url = href if href.startswith("http") else f"https://gaming.lenovo.com{href}"
+
+            parent = a.find_parent(["div", "article", "section", "li"])
+            img = parent.find("img") if parent else None
+            thumbnail = ""
+            if img:
+                thumbnail = img.get("src") or img.get("data-src") or ""
+
+            drops.append({
+                "id": f"lenovo_drop_{drop_id_str}",
+                "title": title,
+                "description": "Exclusive free Game Key Drop on Lenovo Legion Community!",
+                "claim_url": claim_url,
+                "thumbnail": thumbnail,
+                "expiry": None,
+            })
+
+    return drops
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1071,29 @@ def send_telegram_deal(deal: dict, store_name: str) -> None:
     _send_text(message)
 
 
+def send_telegram_key_drop(drop: dict, platform_name: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
+        return
+
+    title = drop["title"]
+    desc = drop.get("description", "")
+    claim_url = drop.get("claim_url", "")
+    thumbnail = drop.get("thumbnail", "")
+
+    message = (
+        f"🎁 <b>New Game Key Drop on {platform_name}!</b>\n\n"
+        f"<b>{title}</b>\n"
+        f"{desc}\n\n"
+        f"🆓 <b>100% Free Key Drop</b> (Limited Quantity)\n\n"
+        f"<a href='{claim_url}'>Claim Key Now</a>"
+    )
+
+    if _send_photo(thumbnail, message):
+        return
+    _send_text(message)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1113,6 +1195,48 @@ def check_deal_source(name: str, fetch_fn, send_fn, platform: str) -> int:
     return notified
 
 
+def check_key_drop_source(name: str, fetch_fn, send_fn, platform: str) -> int:
+    print(f"\n[{datetime.now().isoformat()}] Checking {name} Key Drops…")
+
+    known_ids = db.load_known_key_drop_ids(platform)
+    print(f"  [DB tracked_key_drops] Known {name} key drop count: {len(known_ids)}")
+
+    try:
+        current = fetch_fn()
+    except Exception as e:
+        print(f"  ❌ Failed to fetch {name} key drops: {e}", file=sys.stderr)
+        _send_alert(f"Failed to fetch {name} key drops:\n<code>{e}</code>")
+        return 0
+
+    if current is None:
+        print(f"  ❌ {name} key drops fetch returned no data", file=sys.stderr)
+        return 0
+
+    current_ids = {d["id"] for d in current}
+    print(f"  Current key drops: {[d['title'] for d in current]}")
+
+    new_ids = current_ids - known_ids
+    notified = 0
+    if new_ids:
+        print(f"  New key drops detected: {new_ids}")
+        for drop in current:
+            if drop["id"] in new_ids:
+                print(f"  Notifying about key drop: {drop['title']}")
+                try:
+                    send_fn(drop, name)
+                    print(f"  ✅ Notification sent for key drop: {drop['title']}")
+                    notified += 1
+                except Exception as e:
+                    print(f"  ❌ Failed to send key drop notification: {e}", file=sys.stderr)
+    else:
+        print("  No new key drops found.")
+
+    db.save_key_drops(platform, current)
+    print(f"  [DB tracked_key_drops] Saved active {name} key drops to database.")
+
+    return notified
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -1137,6 +1261,9 @@ def main() -> int:
     total += check_deal_source("Steam", get_steam_discount_deals, send_telegram_deal, "steam")
     total += check_deal_source("Epic Games", get_epic_discount_deals, send_telegram_deal, "epic")
 
+    # Key Drops (separate tracked_key_drops DB table)
+    total += check_key_drop_source("Lenovo Legion", get_lenovo_key_drops, send_telegram_key_drop, "lenovo")
+
     if total == 0:
         send_telegram_no_new_games()
 
@@ -1147,5 +1274,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 

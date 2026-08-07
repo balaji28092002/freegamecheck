@@ -1,6 +1,6 @@
-# Free Games Telegram Bot (Epic Games, Amazon Luna, itch.io, STOVE Store & Steam)
+# Free Games Telegram Bot (Epic Games, Amazon Luna, itch.io, STOVE Store, Steam & Lenovo Legion)
 
-Checks Epic Games Store, Amazon Luna, itch.io, STOVE Store, and Steam daily for 100% off / free games and sends Telegram notifications.
+Checks Epic Games Store, Amazon Luna, itch.io, STOVE Store, Steam, and Lenovo Legion Key Drops daily for 100% off free games, 90%+ discount deals, and game key drops, sending notifications via Telegram.
 
 ## Setup
 
@@ -15,10 +15,17 @@ Checks Epic Games Store, Amazon Luna, itch.io, STOVE Store, and Steam daily for 
 
 4. **Push to GitHub** — the workflow runs daily at 10 AM IST. You can also trigger it manually from the Actions tab.
 
+## Database Tables (Neon PostgreSQL)
+
+- `tracked_games` — Tracks 100% off free store games (Epic Games, Amazon Luna, itch.io, STOVE, Steam)
+- `tracked_deals` — Tracks 90%+ discount sales (Steam & Epic Games)
+- `tracked_key_drops` — Tracks 100% free game key drops & community voucher drops (Lenovo Legion)
+
 ## Files
 
-- `check_games.py` — Main checker script (Epic Games, Amazon Luna, itch.io, STOVE Store, Steam)
-- `db.py` — Neon PostgreSQL database tracking layer
+- `check_games.py` — Main checker script (Epic Games, Amazon Luna, itch.io, STOVE Store, Steam, Lenovo Legion)
+- `db.py` — Neon PostgreSQL database tracking layer (`tracked_games`, `tracked_deals`, `tracked_key_drops`)
 - `.github/workflows/check.yml` — GitHub Actions workflow
 - `requirements.txt` — Python dependencies
+
 
