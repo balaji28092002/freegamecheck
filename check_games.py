@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, and Steam free games, notify via Telegram."""
+"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, Steam, and Xbox PC free games & deals, notify via Telegram."""
 
 import json
 import os
@@ -7,6 +7,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import re
 import requests
@@ -56,6 +57,12 @@ STEAM_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
 LENOVO_KEY_DROPS_URL = "https://gaming.lenovo.com/game-key-drops"
+XBOX_SALES_URL = "https://www.xbox.com/en-in/promotions/sales/sales-and-specials?xr=shellnav"
+XBOX_CATALOG_URL = "https://displaycatalog.mp.microsoft.com/v7.0/products"
+XBOX_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
 LUNA_GRAPHQL_QUERY = """
 query OffersContext_Offers_And_Items($dateOverride: Time, $pageSize: Int) {
   games: items(collectionType: FREE_GAMES, dateOverride: $dateOverride, pageSize: $pageSize) {
@@ -806,6 +813,205 @@ def get_lenovo_key_drops() -> list[dict] | None:
 
 
 # ---------------------------------------------------------------------------
+# Xbox Store (PC Games & Deals)
+# ---------------------------------------------------------------------------
+
+_xbox_cache: dict[str, Any] = {"fetched": False, "free_games": [], "discount_deals": []}
+
+
+def _is_xbox_pc_compatible(prod: dict, sku: dict, avail: dict) -> bool:
+    props = prod.get("Properties") or {}
+    if props.get("XboxXPA") is True:
+        return True
+
+    attrs = props.get("Attributes") or []
+    for a in attrs:
+        app_plat = a.get("ApplicablePlatforms") or []
+        if any(p in ("Desktop", "PC", "Windows.Desktop") for p in app_plat):
+            return True
+
+    sku_props = sku.get("Properties") or {}
+    packages = sku_props.get("Packages") or []
+    for pkg in packages:
+        deps = pkg.get("PlatformDependencies") or []
+        for d in deps:
+            pname = d.get("PlatformName", "")
+            if any(p in pname for p in ("Desktop", "Universal", "PC")):
+                return True
+
+    cond = avail.get("Conditions") or {}
+    client_cond = cond.get("ClientConditions") or {}
+    platforms = client_cond.get("AllowedPlatforms") or []
+    for pl in platforms:
+        if isinstance(pl, dict):
+            pname = pl.get("PlatformName", "")
+            if any(p in pname for p in ("Desktop", "Universal", "PC")):
+                return True
+        elif isinstance(pl, str) and any(p in pl for p in ("Desktop", "Universal", "PC")):
+            return True
+
+    return False
+
+
+def _fetch_xbox_data() -> bool:
+    if _xbox_cache["fetched"]:
+        return True
+
+    headers = {"User-Agent": XBOX_USER_AGENT}
+    try:
+        resp = requests.get(XBOX_SALES_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  ⚠️ Failed to fetch Xbox sales page: {e}", file=sys.stderr)
+        return False
+
+    pids = set(m.upper() for m in re.findall(r'/games/store/[a-zA-Z0-9-]+/([a-zA-Z0-9]{12})', resp.text, re.IGNORECASE))
+
+    idx = resp.text.find("window.__PRELOADED_STATE__ = ")
+    if idx != -1:
+        try:
+            start = idx + len("window.__PRELOADED_STATE__ = ")
+            decoder = json.JSONDecoder()
+            data, _ = decoder.raw_decode(resp.text[start:])
+            content = data.get("content", {}) or {}
+            channels = content.get("channels", {}).get("channelData", {}) or {}
+            for ck, cv in channels.items():
+                prods = cv.get("data", {}).get("products", []) or []
+                for p in prods:
+                    pid = p.get("productId")
+                    if pid:
+                        pids.add(pid.upper())
+        except Exception as e:
+            print(f"  ⚠️ Warning: Failed to parse Xbox PRELOADED_STATE: {e}", file=sys.stderr)
+
+    if not pids:
+        _xbox_cache["fetched"] = True
+        _xbox_cache["free_games"] = []
+        _xbox_cache["discount_deals"] = []
+        return True
+
+    all_pids = list(pids)
+    chunks = [all_pids[i:i + 30] for i in range(0, len(all_pids), 30)]
+
+    free_games = []
+    discount_deals = []
+    seen_free = set()
+    seen_deals = set()
+    month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
+
+    for chunk in chunks:
+        params = {
+            "bigIds": ",".join(chunk),
+            "market": "IN",
+            "languages": "en-in",
+            "MS-CV": "DUMMY",
+        }
+        try:
+            cat_resp = requests.get(XBOX_CATALOG_URL, params=params, headers=headers, timeout=30)
+            cat_resp.raise_for_status()
+            products = cat_resp.json().get("Products", []) or []
+        except Exception as e:
+            print(f"  ⚠️ Failed to fetch Xbox DisplayCatalog for chunk: {e}", file=sys.stderr)
+            continue
+
+        for p in products:
+            try:
+                pid = p.get("ProductId")
+                if not pid:
+                    continue
+
+                loc_props = p.get("LocalizedProperties", []) or []
+                loc = loc_props[0] if loc_props else {}
+                title = loc.get("ProductTitle", "Unknown Game")
+                desc = loc.get("ProductDescription", "")
+
+                thumbnail = ""
+                for img in loc.get("Images", []) or []:
+                    purpose = img.get("ImagePurpose", "")
+                    if purpose in ("Poster", "BoxArt", "FeaturePromotionalSquareArt", "Logo", "Tile"):
+                        thumbnail = img.get("Uri", "")
+                        if thumbnail.startswith("//"):
+                            thumbnail = f"https:{thumbnail}"
+                        break
+                if not thumbnail and loc.get("Images"):
+                    thumbnail = loc["Images"][0].get("Uri", "")
+                    if thumbnail.startswith("//"):
+                        thumbnail = f"https:{thumbnail}"
+
+                claim_url = f"https://www.xbox.com/en-in/games/store/{pid}"
+
+                for sku_item in p.get("DisplaySkuAvailabilities", []) or []:
+                    sku = sku_item.get("Sku") or {}
+                    for avail in sku_item.get("Availabilities", []) or []:
+                        if not _is_xbox_pc_compatible(p, sku, avail):
+                            continue
+
+                        order = avail.get("OrderManagementData") or {}
+                        price = order.get("Price") or {}
+                        msrp = price.get("MSRP", 0.0)
+                        list_price = price.get("ListPrice", 0.0)
+                        currency = price.get("CurrencyCode", "INR")
+
+                        avail_end = avail.get("Conditions", {}).get("EndDate")
+
+                        # 100% Free Game Check
+                        if list_price == 0 and msrp > 0:
+                            if pid not in seen_free:
+                                seen_free.add(pid)
+                                orig_str = f"₹{msrp:.2f}" if currency == "INR" else f"{currency} {msrp}"
+                                free_games.append({
+                                    "id": f"xbox_{pid}",
+                                    "title": title,
+                                    "description": desc,
+                                    "claim_url": claim_url,
+                                    "thumbnail": thumbnail,
+                                    "original_price": orig_str,
+                                    "currency": currency,
+                                    "expiry": avail_end,
+                                })
+                        # 90%+ Discount Deal Check
+                        elif msrp > 0 and list_price > 0 and list_price < msrp:
+                            pct = int(round((1 - (list_price / msrp)) * 100))
+                            if 90 <= pct < 100:
+                                if pid not in seen_deals:
+                                    seen_deals.add(pid)
+                                    orig_str = f"₹{msrp:.2f}" if currency == "INR" else f"{currency} {msrp}"
+                                    disc_str = f"₹{list_price:.2f}" if currency == "INR" else f"{currency} {list_price}"
+                                    discount_deals.append({
+                                        "id": f"xbox_deal_{month_prefix}_{pid}",
+                                        "title": title,
+                                        "description": desc,
+                                        "claim_url": claim_url,
+                                        "thumbnail": thumbnail,
+                                        "original_price": orig_str,
+                                        "discounted_price": disc_str,
+                                        "discount_pct": f"{pct}%",
+                                        "currency": currency,
+                                        "expiry": avail_end,
+                                    })
+            except Exception as e:
+                print(f"  ⚠️ Skipping malformed Xbox product: {e}", file=sys.stderr)
+                continue
+
+    _xbox_cache["fetched"] = True
+    _xbox_cache["free_games"] = free_games
+    _xbox_cache["discount_deals"] = discount_deals
+    return True
+
+
+def get_xbox_free_games() -> list[dict] | None:
+    if not _fetch_xbox_data():
+        return None
+    return _xbox_cache["free_games"]
+
+
+def get_xbox_discount_deals() -> list[dict] | None:
+    if not _fetch_xbox_data():
+        return None
+    return _xbox_cache["discount_deals"]
+
+
+# ---------------------------------------------------------------------------
 # Telegram notifications
 # ---------------------------------------------------------------------------
 
@@ -887,7 +1093,7 @@ def send_telegram_no_new_games() -> None:
 
     message = (
         "ℹ️ <b>No New Free Games Today</b>\n\n"
-        "Checked Epic Games, Amazon Luna, itch.io, STOVE Store, and Steam.\n"
+        "Checked Epic Games, Amazon Luna, itch.io, STOVE Store, Steam, and Xbox (PC).\n"
         "There are no new currently available free games."
     )
     try:
@@ -1024,6 +1230,46 @@ def send_telegram_steam(game: dict) -> None:
 
     message = (
         f"🎮 <b>New Free Game on Steam! (100% Off)</b>\n\n"
+        f"<b>{title}</b>\n"
+        f"{desc_str}"
+        f"{price_str}"
+        f"{expires_str}"
+        f"<a href='{claim_url}'>Claim Now</a>"
+    )
+
+    if _send_photo(thumbnail, message):
+        return
+    _send_text(message)
+
+
+def send_telegram_xbox(game: dict) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
+        return
+
+    title = game["title"]
+    desc = game.get("description", "")
+    if desc:
+        desc = desc[:200] + ("…" if len(desc) > 200 else "")
+
+    original = game.get("original_price", "")
+    claim_url = game.get("claim_url", "")
+    thumbnail = game.get("thumbnail", "")
+    expiry = game.get("expiry")
+
+    expires_str = ""
+    if expiry:
+        try:
+            expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            expires_str = f"⏳ Free until: {expiry_dt.strftime('%B %d, %Y at %I:%M %p UTC')}\n\n"
+        except (ValueError, TypeError):
+            pass
+
+    price_str = f"💰 Original Price: {original}\n" if original else "💰 100% Discount (Free)\n"
+    desc_str = f"{desc}\n\n" if desc else ""
+
+    message = (
+        f"🎮 <b>New Free PC Game on Xbox! (100% Off)</b>\n\n"
         f"<b>{title}</b>\n"
         f"{desc_str}"
         f"{price_str}"
@@ -1256,10 +1502,12 @@ def main() -> int:
     total += check_source("itch.io", get_itch_free_games, send_telegram_itch, "itch")
     total += check_source("STOVE Store", get_stove_free_games, send_telegram_stove, "stove")
     total += check_source("Steam", get_steam_free_games, send_telegram_steam, "steam")
+    total += check_source("Xbox (PC)", get_xbox_free_games, send_telegram_xbox, "xbox")
 
     # 90%+ Discount Deals (separate tracked_deals DB table)
     total += check_deal_source("Steam", get_steam_discount_deals, send_telegram_deal, "steam")
     total += check_deal_source("Epic Games", get_epic_discount_deals, send_telegram_deal, "epic")
+    total += check_deal_source("Xbox (PC)", get_xbox_discount_deals, send_telegram_deal, "xbox")
 
     # Key Drops (separate tracked_key_drops DB table)
     total += check_key_drop_source("Lenovo Legion", get_lenovo_key_drops, send_telegram_key_drop, "lenovo")

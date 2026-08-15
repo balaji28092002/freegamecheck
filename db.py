@@ -167,7 +167,7 @@ def init_db() -> None:
 
 
 def load_known_game_ids(platform: str) -> set[str]:
-    """Fetch set of known game IDs from DB for given platform ('epic', 'luna', 'itch', 'stove', 'steam')."""
+    """Fetch set of known game IDs from DB for given platform ('epic', 'luna', 'itch', 'stove', 'steam', 'xbox')."""
     if not is_db_enabled():
         return set()
 
