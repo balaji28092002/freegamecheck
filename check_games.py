@@ -50,7 +50,7 @@ STEAM_SEARCH_URL = (
 )
 STEAM_DEALS_SEARCH_URL = (
     "https://store.steampowered.com/search/results/"
-    "?query&start={start}&count=100&specials=1&cc=in&l=english&infinite=1"
+    "?query&start={start}&count=100&specials=1&category1=998&cc=in&l=english&infinite=1"
 )
 STEAM_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -754,7 +754,7 @@ def get_steam_free_games() -> list[dict] | None:
     return free_games
 
 
-def get_steam_discount_deals(max_pages: int = 8) -> list[dict] | None:
+def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
     headers = {
         "User-Agent": STEAM_USER_AGENT,
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -762,87 +762,120 @@ def get_steam_discount_deals(max_pages: int = 8) -> list[dict] | None:
     }
     deals = []
     seen_ids = set()
+    total_store_games = None
+    page = 0
 
-    for page in range(max_pages):
+    while page < max_pages:
         start = page * 100
+        if total_store_games is not None and start >= total_store_games:
+            break
+
         url = STEAM_DEALS_SEARCH_URL.format(start=start)
-        try:
-            resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 429:
-                print(f"  ⚠️ Steam rate limit encountered on page {page}. Waiting 2s before retrying...", file=sys.stderr)
-                time.sleep(2.0)
-                resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"  ⚠️ Failed to fetch Steam Deals Search API (page {page}): {e}", file=sys.stderr)
-            break
-        except json.JSONDecodeError as e:
-            print(f"  ⚠️ Invalid JSON from Steam Deals Search API (page {page}): {e}", file=sys.stderr)
-            break
+        success = False
+        last_error = None
 
-        content = data.get("results_html", "")
-        if not content:
-            break
-
-        soup = BeautifulSoup(content, "html.parser")
-        rows = soup.find_all("a", class_="search_result_row")
-        if not rows:
-            break
-
-        for r in rows:
+        for attempt in range(1, 4):
             try:
-                ds_appid = r.get("data-ds-appid", "")
-                if not ds_appid:
-                    continue
-                appid = ds_appid.split(",")[0].strip()
-                if not appid or appid in seen_ids:
-                    continue
-
-                pct_elem = r.find("div", class_="discount_pct")
-                if not pct_elem:
-                    continue
-                pct_str = pct_elem.text.strip().replace("-", "").replace("%", "")
-                try:
-                    pct = int(pct_str)
-                except ValueError:
+                resp = requests.get(url, headers=headers, timeout=25)
+                if resp.status_code == 429:
+                    wait_sec = attempt * 8.0
+                    print(
+                        f"  ⚠️ Steam rate limit (429) on page {page} (attempt {attempt}/3). Backing off {wait_sec}s...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait_sec)
                     continue
 
-                # Strictly 90% to 99% off (excluding 100% free games to avoid duplicate notification)
-                if not (90 <= pct < 100):
-                    continue
+                resp.raise_for_status()
+                data = resp.json()
 
-                seen_ids.add(appid)
-                title_elem = r.find("span", class_="title")
-                title = title_elem.text.strip() if title_elem else "Unknown Game"
+                if total_store_games is None:
+                    total_store_games = data.get("total_count", 0)
 
-                price_elem = r.find("div", class_="discount_prices")
-                strike_elem = price_elem.find("div", class_="discount_original_price") if price_elem else None
-                final_elem = price_elem.find("div", class_="discount_final_price") if price_elem else None
+                content = data.get("results_html", "")
+                if not content:
+                    break
 
-                original_price = strike_elem.text.strip() if strike_elem else ""
-                discounted_price = final_elem.text.strip() if final_elem else ""
+                soup = BeautifulSoup(content, "html.parser")
+                rows = soup.find_all("a", class_="search_result_row")
+                if not rows:
+                    break
 
-                thumbnail = f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg"
-                claim_url = f"https://store.steampowered.com/app/{appid}/"
+                for r in rows:
+                    try:
+                        ds_appid = r.get("data-ds-appid", "")
+                        if not ds_appid:
+                            continue
+                        appid = ds_appid.split(",")[0].strip()
+                        if not appid or appid in seen_ids:
+                            continue
 
-                month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
-                deals.append({
-                    "id": f"steam_deal_{month_prefix}_{appid}",
-                    "title": title,
-                    "description": "",
-                    "claim_url": claim_url,
-                    "thumbnail": thumbnail,
-                    "original_price": original_price,
-                    "discounted_price": discounted_price,
-                    "discount_pct": f"{pct}%",
-                    "expiry": None,
-                })
+                        pct_elem = r.find("div", class_="discount_pct")
+                        if not pct_elem:
+                            continue
+                        pct_str = pct_elem.text.strip().replace("-", "").replace("%", "")
+                        try:
+                            pct = int(pct_str)
+                        except ValueError:
+                            continue
+
+                        # Strictly 90% to 99% off (excluding 100% free games to avoid duplicate notification)
+                        if not (90 <= pct < 100):
+                            continue
+
+                        seen_ids.add(appid)
+                        title_elem = r.find("span", class_="title")
+                        title = title_elem.text.strip() if title_elem else "Unknown Game"
+
+                        price_elem = r.find("div", class_="discount_prices")
+                        strike_elem = price_elem.find("div", class_="discount_original_price") if price_elem else None
+                        final_elem = price_elem.find("div", class_="discount_final_price") if price_elem else None
+
+                        original_price = strike_elem.text.strip() if strike_elem else ""
+                        discounted_price = final_elem.text.strip() if final_elem else ""
+
+                        thumbnail = f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg"
+                        claim_url = f"https://store.steampowered.com/app/{appid}/"
+
+                        month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
+                        deals.append({
+                            "id": f"steam_deal_{month_prefix}_{appid}",
+                            "title": title,
+                            "description": "",
+                            "claim_url": claim_url,
+                            "thumbnail": thumbnail,
+                            "original_price": original_price,
+                            "discounted_price": discounted_price,
+                            "discount_pct": f"{pct}%",
+                            "expiry": None,
+                        })
+                    except Exception as e:
+                        print(f"  ⚠️ Skipping malformed Steam deal entry: {e}", file=sys.stderr)
+                        continue
+
+                success = True
+                break
             except Exception as e:
-                print(f"  ⚠️ Skipping malformed Steam deal entry: {e}", file=sys.stderr)
-                continue
+                last_error = e
+                wait_sec = attempt * 8.0
+                print(
+                    f"  ⚠️ Error fetching Steam Deals page {page} (attempt {attempt}/3): {e}. Retrying after {wait_sec}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait_sec)
 
-        time.sleep(0.5)
+        if not success:
+            err_msg = f"Steam Deals fetch encountered persistent error on page {page} after 3 retries: {last_error}"
+            print(f"  ❌ {err_msg}", file=sys.stderr)
+            _send_alert(f"⚠️ <b>Steam Deals Alert</b>\n\n{err_msg}\nProceeding with {len(deals)} deals found so far.")
+            break
+
+        page += 1
+        # Moderate pace with extra breather every 15 pages to keep Steam rate limiters cool
+        if page % 15 == 0:
+            time.sleep(2.0)
+        else:
+            time.sleep(0.5)
 
     return deals
 
