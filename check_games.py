@@ -755,11 +755,16 @@ def get_steam_free_games() -> list[dict] | None:
 
 
 def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
-    headers = {
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": STEAM_USER_AGENT,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
-    }
+    })
+    session.cookies.set("birthtime", "283993201", domain="store.steampowered.com")
+    session.cookies.set("mature_content", "1", domain="store.steampowered.com")
+    session.cookies.set("wants_mature_content", "1", domain="store.steampowered.com")
+
     deals = []
     seen_ids = set()
     total_store_games = None
@@ -772,15 +777,16 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
 
         url = STEAM_DEALS_SEARCH_URL.format(start=start)
         success = False
+        end_of_results = False
         last_error = None
 
-        for attempt in range(1, 4):
+        for attempt in range(1, 5):
             try:
-                resp = requests.get(url, headers=headers, timeout=25)
+                resp = session.get(url, timeout=25)
                 if resp.status_code == 429:
-                    wait_sec = attempt * 8.0
+                    wait_sec = attempt * 25.0
                     print(
-                        f"  ⚠️ Steam rate limit (429) on page {page} (attempt {attempt}/3). Backing off {wait_sec}s...",
+                        f"  ⚠️ Steam rate limit (429) on page {page} (attempt {attempt}/4). Backing off {wait_sec}s...",
                         file=sys.stderr,
                     )
                     time.sleep(wait_sec)
@@ -793,12 +799,16 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
                     total_store_games = data.get("total_count", 0)
 
                 content = data.get("results_html", "")
-                if not content:
+                if not content or not content.strip():
+                    end_of_results = True
+                    success = True
                     break
 
                 soup = BeautifulSoup(content, "html.parser")
                 rows = soup.find_all("a", class_="search_result_row")
                 if not rows:
+                    end_of_results = True
+                    success = True
                     break
 
                 for r in rows:
@@ -857,25 +867,25 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
                 break
             except Exception as e:
                 last_error = e
-                wait_sec = attempt * 8.0
+                wait_sec = attempt * 20.0
                 print(
-                    f"  ⚠️ Error fetching Steam Deals page {page} (attempt {attempt}/3): {e}. Retrying after {wait_sec}s...",
+                    f"  ⚠️ Error fetching Steam Deals page {page} (attempt {attempt}/4): {e}. Retrying after {wait_sec}s...",
                     file=sys.stderr,
                 )
                 time.sleep(wait_sec)
 
+        if end_of_results:
+            break
+
         if not success:
-            err_msg = f"Steam Deals fetch encountered persistent error on page {page} after 3 retries: {last_error}"
+            err_msg = f"Steam Deals fetch encountered persistent error on page {page} after 4 retries: {last_error}"
             print(f"  ❌ {err_msg}", file=sys.stderr)
             _send_alert(f"⚠️ <b>Steam Deals Alert</b>\n\n{err_msg}\nProceeding with {len(deals)} deals found so far.")
             break
 
         page += 1
-        # Moderate pace with extra breather every 15 pages to keep Steam rate limiters cool
-        if page % 15 == 0:
-            time.sleep(2.0)
-        else:
-            time.sleep(0.5)
+        # 1.1s steady pace between pages to avoid hitting Steam's 429 rate limit
+        time.sleep(1.1)
 
     return deals
 
