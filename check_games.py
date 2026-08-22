@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, Steam, and Xbox PC free games & deals, notify via Telegram."""
 
+import argparse
+import html
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import re
@@ -20,6 +23,30 @@ except ImportError:
     pass
 
 import db
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+MAX_STEAM_DEAL_PAGES = 70          # Steam deals crawl depth (100 games per page)
+STEAM_PAGE_PACE_SECONDS = 1.1      # Steady pace between Steam deal pages (429 avoidance)
+STEAM_MAX_RETRIES = 4              # Retries per Steam page (429 backoff: attempt * 25s)
+STEAM_REQUEST_TIMEOUT = 25
+DEFAULT_REQUEST_TIMEOUT = 30
+EPIC_CATALOG_PAGE_SIZE = 100       # Epic GraphQL on-sale catalog page size
+EPIC_CATALOG_TIMEOUT = 30
+XBOX_CATALOG_CHUNK_SIZE = 30       # Xbox DisplayCatalog bigIds per request
+XBOX_CATALOG_CONCURRENCY = 4       # Parallel Xbox DisplayCatalog chunk fetches
+XBOX_SALES_TIMEOUT = 30
+ITCH_MAX_PAGES = 5
+STOVE_MAX_PAGES = 5
+DISCOUNT_DEAL_MIN_PCT = 90         # Deals are 90%..99% off (100% handled as free games)
+DISCOUNT_DEAL_MAX_PCT = 99
+TELEGRAM_SEND_TIMEOUT = 15
+TELEGRAM_MAX_RETRIES = 3           # Retries on Telegram 429 (backoff: attempt * 5s)
+DESC_MAX_LEN = 200
+
+DRY_RUN = False                    # Set by --dry-run; suppresses all Telegram sends
 
 
 EPIC_API_URL = (
@@ -162,6 +189,7 @@ query searchStoreQuery($allowCountries: String, $category: String, $count: Int, 
 """
 
 _epic_cache: dict[str, Any] = {"fetched": False, "free_games": [], "discount_deals": []}
+_EPIC_FETCH_LOCK = threading.Lock()
 
 
 def _extract_epic_slug(el: dict) -> str:
@@ -185,6 +213,10 @@ def _extract_epic_slug(el: dict) -> str:
 
 
 def _fetch_epic_data() -> bool:
+    with _EPIC_FETCH_LOCK:
+        return _fetch_epic_data_unlocked()
+
+def _fetch_epic_data_unlocked() -> bool:
     if _epic_cache["fetched"]:
         return True
 
@@ -195,14 +227,9 @@ def _fetch_epic_data() -> bool:
     seen_free = set()
     seen_deals = set()
 
-    headers = {
-        "User-Agent": STEAM_USER_AGENT,
-        "Content-Type": "application/json"
-    }
-
     # 1. Fetch official curated weekly free games from Epic promotions API
     try:
-        resp = requests.get(EPIC_API_URL, timeout=30)
+        resp = requests.get(EPIC_API_URL, timeout=DEFAULT_REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         elements = data["data"]["Catalog"]["searchStore"]["elements"]
@@ -266,12 +293,17 @@ def _fetch_epic_data() -> bool:
         print(f"  ⚠️ Failed to fetch Epic promotions API: {e}", file=sys.stderr)
 
     # 2. Fetch full storewide on-sale catalog via GraphQL (handles 100% off sales & 90%+ discount deals)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": STEAM_USER_AGENT,
+        "Content-Type": "application/json",
+    })
     start = 0
     while True:
         variables = {
             "allowCountries": "IN",
             "category": "games/edition/base",
-            "count": 40,
+            "count": EPIC_CATALOG_PAGE_SIZE,
             "country": "IN",
             "locale": "en-US",
             "sortBy": "releaseDate",
@@ -281,11 +313,10 @@ def _fetch_epic_data() -> bool:
         }
 
         try:
-            resp = requests.post(
+            resp = session.post(
                 EPIC_GRAPHQL_URL,
                 json={"query": EPIC_CATALOG_ON_SALE_QUERY, "variables": variables},
-                headers=headers,
-                timeout=30
+                timeout=EPIC_CATALOG_TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -372,7 +403,7 @@ def _fetch_epic_data() -> bool:
                 # 90%+ Discount Deal
                 elif disc < orig:
                     pct = int(round((1 - disc / orig) * 100))
-                    if 90 <= pct < 100:
+                    if DISCOUNT_DEAL_MIN_PCT <= pct <= DISCOUNT_DEAL_MAX_PCT:
                         if game_id not in seen_deals:
                             seen_deals.add(game_id)
                             discount_deals.append({
@@ -418,7 +449,7 @@ def get_epic_discount_deals() -> list[dict] | None:
 # ---------------------------------------------------------------------------
 
 def _get_luna_csrf_token(session: requests.Session) -> str:
-    resp = session.get(LUNA_PAGE_URL, timeout=30)
+    resp = session.get(LUNA_PAGE_URL, timeout=DEFAULT_REQUEST_TIMEOUT)
     resp.raise_for_status()
     match = re.search(r'name=["\']csrf-key["\']\s+value=["\']([^"\']+)', resp.text)
     if not match:
@@ -455,7 +486,7 @@ def get_luna_free_games() -> list[dict] | None:
                 "Referer": LUNA_PAGE_URL,
                 "Origin": "https://luna.amazon.com",
             },
-            timeout=30,
+            timeout=DEFAULT_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -509,7 +540,7 @@ def get_luna_free_games() -> list[dict] | None:
 # itch.io
 # ---------------------------------------------------------------------------
 
-def get_itch_free_games(max_pages: int = 5) -> list[dict] | None:
+def get_itch_free_games(max_pages: int = ITCH_MAX_PAGES) -> list[dict] | None:
     headers = {"User-Agent": ITCH_USER_AGENT}
     free_games = []
     seen_ids = set()
@@ -517,7 +548,7 @@ def get_itch_free_games(max_pages: int = 5) -> list[dict] | None:
     for page in range(1, max_pages + 1):
         url = f"{ITCH_ON_SALE_URL}&page={page}"
         try:
-            resp = requests.get(url, headers=headers, timeout=30)
+            resp = requests.get(url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -594,7 +625,7 @@ def get_itch_free_games(max_pages: int = 5) -> list[dict] | None:
 # STOVE Store
 # ---------------------------------------------------------------------------
 
-def get_stove_free_games(max_pages: int = 5) -> list[dict] | None:
+def get_stove_free_games(max_pages: int = STOVE_MAX_PAGES) -> list[dict] | None:
     free_games = []
     seen_ids = set()
 
@@ -623,7 +654,7 @@ def get_stove_free_games(max_pages: int = 5) -> list[dict] | None:
         }
 
         try:
-            resp = requests.get(STOVE_API_URL, headers=headers, params=params, timeout=30)
+            resp = requests.get(STOVE_API_URL, headers=headers, params=params, timeout=DEFAULT_REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
@@ -699,7 +730,7 @@ def get_steam_free_games() -> list[dict] | None:
         "X-Requested-With": "XMLHttpRequest",
     }
     try:
-        resp = requests.get(STEAM_SEARCH_URL, headers=headers, timeout=30)
+        resp = requests.get(STEAM_SEARCH_URL, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
@@ -754,7 +785,7 @@ def get_steam_free_games() -> list[dict] | None:
     return free_games
 
 
-def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
+def get_steam_discount_deals(max_pages: int = MAX_STEAM_DEAL_PAGES) -> list[dict] | None:
     session = requests.Session()
     session.headers.update({
         "User-Agent": STEAM_USER_AGENT,
@@ -780,13 +811,13 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
         end_of_results = False
         last_error = None
 
-        for attempt in range(1, 5):
+        for attempt in range(1, STEAM_MAX_RETRIES + 1):
             try:
-                resp = session.get(url, timeout=25)
+                resp = session.get(url, timeout=STEAM_REQUEST_TIMEOUT)
                 if resp.status_code == 429:
                     wait_sec = attempt * 25.0
                     print(
-                        f"  ⚠️ Steam rate limit (429) on page {page} (attempt {attempt}/4). Backing off {wait_sec}s...",
+                        f"  ⚠️ Steam rate limit (429) on page {page} (attempt {attempt}/{STEAM_MAX_RETRIES}). Backing off {wait_sec}s...",
                         file=sys.stderr,
                     )
                     time.sleep(wait_sec)
@@ -829,8 +860,8 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
                         except ValueError:
                             continue
 
-                        # Strictly 90% to 99% off (excluding 100% free games to avoid duplicate notification)
-                        if not (90 <= pct < 100):
+                        # Strictly DISCOUNT_DEAL_MIN_PCT..MAX_PCT% off (excluding 100% free games to avoid duplicate notification)
+                        if not (DISCOUNT_DEAL_MIN_PCT <= pct <= DISCOUNT_DEAL_MAX_PCT):
                             continue
 
                         seen_ids.add(appid)
@@ -869,7 +900,7 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
                 last_error = e
                 wait_sec = attempt * 20.0
                 print(
-                    f"  ⚠️ Error fetching Steam Deals page {page} (attempt {attempt}/4): {e}. Retrying after {wait_sec}s...",
+                    f"  ⚠️ Error fetching Steam Deals page {page} (attempt {attempt}/{STEAM_MAX_RETRIES}): {e}. Retrying after {wait_sec}s...",
                     file=sys.stderr,
                 )
                 time.sleep(wait_sec)
@@ -878,14 +909,14 @@ def get_steam_discount_deals(max_pages: int = 70) -> list[dict] | None:
             break
 
         if not success:
-            err_msg = f"Steam Deals fetch encountered persistent error on page {page} after 4 retries: {last_error}"
+            err_msg = f"Steam Deals fetch encountered persistent error on page {page} after {STEAM_MAX_RETRIES} retries: {last_error}"
             print(f"  ❌ {err_msg}", file=sys.stderr)
             _send_alert(f"⚠️ <b>Steam Deals Alert</b>\n\n{err_msg}\nProceeding with {len(deals)} deals found so far.")
             break
 
         page += 1
-        # 1.1s steady pace between pages to avoid hitting Steam's 429 rate limit
-        time.sleep(1.1)
+        # Steady pace between pages to avoid hitting Steam's 429 rate limit
+        time.sleep(STEAM_PAGE_PACE_SECONDS)
 
     return deals
 
@@ -951,6 +982,7 @@ def get_lenovo_key_drops() -> list[dict] | None:
 # ---------------------------------------------------------------------------
 
 _xbox_cache: dict[str, Any] = {"fetched": False, "free_games": [], "discount_deals": []}
+_XBOX_FETCH_LOCK = threading.Lock()
 
 
 def _is_xbox_pc_compatible(prod: dict, sku: dict, avail: dict) -> bool:
@@ -988,12 +1020,17 @@ def _is_xbox_pc_compatible(prod: dict, sku: dict, avail: dict) -> bool:
 
 
 def _fetch_xbox_data() -> bool:
+    with _XBOX_FETCH_LOCK:
+        return _fetch_xbox_data_unlocked()
+
+def _fetch_xbox_data_unlocked() -> bool:
     if _xbox_cache["fetched"]:
         return True
 
-    headers = {"User-Agent": XBOX_USER_AGENT}
+    session = requests.Session()
+    session.headers.update({"User-Agent": XBOX_USER_AGENT})
     try:
-        resp = requests.get(XBOX_SALES_URL, headers=headers, timeout=30)
+        resp = session.get(XBOX_SALES_URL, timeout=XBOX_SALES_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"  ⚠️ Failed to fetch Xbox sales page: {e}", file=sys.stderr)
@@ -1025,7 +1062,7 @@ def _fetch_xbox_data() -> bool:
         return True
 
     all_pids = list(pids)
-    chunks = [all_pids[i:i + 30] for i in range(0, len(all_pids), 30)]
+    chunks = [all_pids[i:i + XBOX_CATALOG_CHUNK_SIZE] for i in range(0, len(all_pids), XBOX_CATALOG_CHUNK_SIZE)]
 
     free_games = []
     discount_deals = []
@@ -1033,7 +1070,7 @@ def _fetch_xbox_data() -> bool:
     seen_deals = set()
     month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
 
-    for chunk in chunks:
+    def fetch_chunk_products(chunk: list[str]) -> list[dict]:
         params = {
             "bigIds": ",".join(chunk),
             "market": "IN",
@@ -1041,13 +1078,17 @@ def _fetch_xbox_data() -> bool:
             "MS-CV": "DUMMY",
         }
         try:
-            cat_resp = requests.get(XBOX_CATALOG_URL, params=params, headers=headers, timeout=30)
+            cat_resp = session.get(XBOX_CATALOG_URL, params=params, timeout=XBOX_SALES_TIMEOUT)
             cat_resp.raise_for_status()
-            products = cat_resp.json().get("Products", []) or []
+            return cat_resp.json().get("Products", []) or []
         except Exception as e:
             print(f"  ⚠️ Failed to fetch Xbox DisplayCatalog for chunk: {e}", file=sys.stderr)
-            continue
+            return []
 
+    with ThreadPoolExecutor(max_workers=min(XBOX_CATALOG_CONCURRENCY, len(chunks))) as pool:
+        chunk_results = pool.map(fetch_chunk_products, chunks)
+
+    for products in chunk_results:
         for p in products:
             try:
                 pid = p.get("ProductId")
@@ -1106,7 +1147,7 @@ def _fetch_xbox_data() -> bool:
                         # 90%+ Discount Deal Check
                         elif msrp > 0 and list_price > 0 and list_price < msrp:
                             pct = int(round((1 - (list_price / msrp)) * 100))
-                            if 90 <= pct < 100:
+                            if DISCOUNT_DEAL_MIN_PCT <= pct <= DISCOUNT_DEAL_MAX_PCT:
                                 if pid not in seen_deals:
                                     seen_deals.add(pid)
                                     orig_str = f"₹{msrp:.2f}" if currency == "INR" else f"{currency} {msrp}"
@@ -1149,75 +1190,123 @@ def get_xbox_discount_deals() -> list[dict] | None:
 # Telegram notifications
 # ---------------------------------------------------------------------------
 
+def _escape(text: str) -> str:
+    """Escape text for Telegram HTML parse mode."""
+    return html.escape(str(text), quote=False)
+
+
+def _truncate_desc(desc: str) -> str:
+    if not desc:
+        return ""
+    return desc[:DESC_MAX_LEN] + ("…" if len(desc) > DESC_MAX_LEN else "")
+
+
+def _format_expiry(expiry: str | None, include_time: bool = True) -> str:
+    """Return a '⏳ Free until: …\\n\\n' line for an ISO expiry string, or ''."""
+    if not expiry:
+        return ""
+    try:
+        expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    fmt = "%B %d, %Y at %I:%M %p UTC" if include_time else "%B %d, %Y"
+    return f"⏳ Free until: {expiry_dt.strftime(fmt)}\n\n"
+
+
+def _post_telegram(method: str, payload: dict) -> requests.Response:
+    if DRY_RUN:
+        print(f"  [dry-run] Would send Telegram {method}.", file=sys.stderr)
+        raise RuntimeError("dry-run: Telegram send suppressed")
+
+    last_resp = None
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                json=payload,
+                timeout=TELEGRAM_SEND_TIMEOUT,
+            )
+            last_resp = resp
+            if resp.status_code == 429:
+                wait_sec = attempt * 5
+                retry_after = resp.headers.get("retry_after")
+                if retry_after and retry_after.isdigit():
+                    wait_sec = max(wait_sec, int(retry_after))
+                print(
+                    f"  ⚠️ Telegram rate limit (429), retry {attempt}/{TELEGRAM_MAX_RETRIES} after {wait_sec}s…",
+                    file=sys.stderr,
+                )
+                time.sleep(wait_sec)
+                continue
+            return resp
+        except requests.RequestException as e:
+            print(f"  ⚠️ Telegram request error (attempt {attempt}/{TELEGRAM_MAX_RETRIES}): {e}", file=sys.stderr)
+            last_resp = None
+            time.sleep(attempt * 5)
+    # Return the last 429 response if we have one; caller raises on !ok.
+    if last_resp is not None:
+        return last_resp
+    raise RuntimeError(f"Telegram {method} failed after {TELEGRAM_MAX_RETRIES} attempts")
+
+
 def _send_photo(thumbnail: str, message: str) -> bool:
     if not thumbnail:
         return False
-    resp = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "photo": thumbnail,
-            "caption": message,
-            "parse_mode": "HTML",
-        },
-        timeout=15,
-    )
+    resp = _post_telegram("sendPhoto", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "photo": thumbnail,
+        "caption": message,
+        "parse_mode": "HTML",
+    })
     return resp.ok
 
 
 def _send_text(message: str) -> None:
-    resp = requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=15,
-    )
+    resp = _post_telegram("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    })
     resp.raise_for_status()
 
 
-def send_telegram_epic(game: dict) -> None:
+def _deliver(thumbnail: str, message: str) -> None:
+    """Send a Telegram photo message, falling back to text; no-op if unconfigured."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
         return
-
-    title = game["title"]
-    desc = game["description"][:200] + ("…" if len(game["description"]) > 200 else "")
-    original = game["original_price"]
-    expiry_dt = datetime.fromisoformat(game["expiry"].replace("Z", "+00:00"))
-    expires = expiry_dt.strftime("%B %d, %Y at %I:%M %p UTC")
-
-    slug = game.get("product_slug") or game.get("url_slug", "")
-    if slug:
-        claim_url = f"https://store.epicgames.com/en-US/p/{slug}"
-    else:
-        claim_url = "https://store.epicgames.com/en-US/free-games"
-
-    images = game.get("key_images", [])
-    thumbnail = ""
-    for img_type in ("Thumbnail", "OfferImageTall", "OfferImageWide"):
-        for img in images:
-            if img.get("type") == img_type:
-                thumbnail = img["url"]
-                break
-        if thumbnail:
-            break
-
-    message = (
-        f"🎮 <b>New Free Game on Epic Games!</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"{desc}\n\n"
-        f"💰 Original Price: {original}\n"
-        f"⏳ Free until: {expires}\n\n"
-        f"<a href='{claim_url}'>Claim Now</a>"
-    )
-
     if _send_photo(thumbnail, message):
         return
     _send_text(message)
+
+
+def _epic_claim_url(game: dict) -> str:
+    slug = game.get("product_slug") or game.get("url_slug", "")
+    return f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/free-games"
+
+
+def _epic_thumbnail(game: dict) -> str:
+    for img_type in ("Thumbnail", "OfferImageTall", "OfferImageWide"):
+        for img in game.get("key_images", []):
+            if img.get("type") == img_type:
+                return img.get("url", "")
+    return ""
+
+
+def send_telegram_epic(game: dict) -> None:
+    expires = _format_expiry(game.get("expiry"))
+    price_line = f"💰 Original Price: {_escape(game['original_price'])}\n" if game.get("original_price") else ""
+    desc = _truncate_desc(game.get("description", ""))
+    message = (
+        f"🎮 <b>New Free Game on Epic Games!</b>\n\n"
+        f"<b>{_escape(game['title'])}</b>\n"
+        + (f"{desc}\n\n" if desc else "")
+        + price_line
+        + expires
+        + f"<a href='{_epic_claim_url(game)}'>Claim Now</a>"
+    )
+    _deliver(_epic_thumbnail(game), message)
 
 
 def send_telegram_no_new_games() -> None:
@@ -1238,247 +1327,132 @@ def send_telegram_no_new_games() -> None:
 
 
 def send_telegram_luna(game: dict) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = game["title"]
-    desc = game.get("description", "")
-    claim_url = game.get("claim_url", "")
-    thumbnail = game.get("thumbnail", "")
-    expiry = game.get("expiry", "")
-
-    expires_str = ""
-    if expiry:
-        try:
-            expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            expires_str = f"⏳ Free until: {expiry_dt.strftime('%B %d, %Y')}\n\n"
-        except (ValueError, TypeError):
-            pass
-
+    desc = _truncate_desc(game.get("description", ""))
+    expires_str = _format_expiry(game.get("expiry"), include_time=False)
     message = (
         f"🎮 <b>New Free Game on Amazon Luna!</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"{desc}\n\n"
-        f"🆓 Free with Prime\n"
-        f"{expires_str}"
-        f"<a href='{claim_url}'>Claim Now</a>"
+        f"<b>{_escape(game['title'])}</b>\n"
+        + (f"{desc}\n\n" if desc else "")
+        + f"🆓 Free with Prime\n"
+        + expires_str
+        + f"<a href='{game.get('claim_url', '')}'>Claim Now</a>"
     )
-
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
+    _deliver(game.get("thumbnail", ""), message)
 
 
 def send_telegram_itch(game: dict) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = game["title"]
-    desc = game.get("description", "")
-    if desc:
-        desc = desc[:200] + ("…" if len(desc) > 200 else "")
-
+    desc = _truncate_desc(game.get("description", ""))
     author = game.get("author", "")
-    author_str = f"by {author}\n" if author else ""
-    claim_url = game.get("claim_url", "")
-    thumbnail = game.get("thumbnail", "")
-
+    author_str = f"by {_escape(author)}\n" if author else ""
     message = (
         f"🎮 <b>New Free Game on itch.io! (100% Off)</b>\n\n"
-        f"<b>{title}</b>\n"
+        f"<b>{_escape(game['title'])}</b>\n"
         f"{author_str}"
-        f"{desc}\n\n"
-        f"💰 100% Discount (Free)\n\n"
-        f"<a href='{claim_url}'>Claim Now</a>"
+        + (f"{desc}\n\n" if desc else "")
+        + f"💰 100% Discount (Free)\n\n"
+        + f"<a href='{game.get('claim_url', '')}'>Claim Now</a>"
     )
-
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
+    _deliver(game.get("thumbnail", ""), message)
 
 
 def send_telegram_stove(game: dict) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = game["title"]
-    desc = game.get("description", "")
-    if desc:
-        desc = desc[:200] + ("…" if len(desc) > 200 else "")
-
-    original = game.get("original_price", "")
-    claim_url = game.get("claim_url", "")
-    thumbnail = game.get("thumbnail", "")
-    expiry = game.get("expiry")
-
-    expires_str = ""
-    if expiry:
-        try:
-            expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            expires_str = f"⏳ Free until: {expiry_dt.strftime('%B %d, %Y at %I:%M %p UTC')}\n\n"
-        except (ValueError, TypeError):
-            pass
-
+    desc = _truncate_desc(game.get("description", ""))
+    expires_str = _format_expiry(game.get("expiry"))
+    price_line = f"💰 Original Price: {_escape(game.get('original_price', ''))}\n" if game.get("original_price") else ""
     message = (
         f"🎮 <b>New Free Game on STOVE Store! (100% Off)</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"{desc}\n\n"
-        f"💰 Original Price: {original}\n"
-        f"{expires_str}"
-        f"<a href='{claim_url}'>Claim Now</a>"
+        f"<b>{_escape(game['title'])}</b>\n"
+        + (f"{desc}\n\n" if desc else "")
+        + price_line
+        + expires_str
+        + f"<a href='{game.get('claim_url', '')}'>Claim Now</a>"
     )
+    _deliver(game.get("thumbnail", ""), message)
 
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
+
+def _generic_free_game(game: dict, store_label: str, heading: str) -> None:
+    desc = _truncate_desc(game.get("description", ""))
+    expires_str = _format_expiry(game.get("expiry"))
+    price_line = f"💰 Original Price: {_escape(game.get('original_price', ''))}\n" if game.get("original_price") else "💰 100% Discount (Free)\n"
+    message = (
+        f"🎮 <b>{heading}</b>\n\n"
+        f"<b>{_escape(game['title'])}</b>\n"
+        + (f"{desc}\n\n" if desc else "")
+        + price_line
+        + expires_str
+        + f"<a href='{game.get('claim_url', '')}'>Claim Now</a>"
+    )
+    _deliver(game.get("thumbnail", ""), message)
 
 
 def send_telegram_steam(game: dict) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = game["title"]
-    desc = game.get("description", "")
-    if desc:
-        desc = desc[:200] + ("…" if len(desc) > 200 else "")
-
-    original = game.get("original_price", "")
-    claim_url = game.get("claim_url", "")
-    thumbnail = game.get("thumbnail", "")
-    expiry = game.get("expiry")
-
-    expires_str = ""
-    if expiry:
-        try:
-            expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            expires_str = f"⏳ Free until: {expiry_dt.strftime('%B %d, %Y at %I:%M %p UTC')}\n\n"
-        except (ValueError, TypeError):
-            pass
-
-    price_str = f"💰 Original Price: {original}\n" if original else "💰 100% Discount (Free)\n"
-    desc_str = f"{desc}\n\n" if desc else ""
-
-    message = (
-        f"🎮 <b>New Free Game on Steam! (100% Off)</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"{desc_str}"
-        f"{price_str}"
-        f"{expires_str}"
-        f"<a href='{claim_url}'>Claim Now</a>"
-    )
-
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
+    _generic_free_game(game, "Steam", "New Free Game on Steam! (100% Off)")
 
 
 def send_telegram_xbox(game: dict) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = game["title"]
-    desc = game.get("description", "")
-    if desc:
-        desc = desc[:200] + ("…" if len(desc) > 200 else "")
-
-    original = game.get("original_price", "")
-    claim_url = game.get("claim_url", "")
-    thumbnail = game.get("thumbnail", "")
-    expiry = game.get("expiry")
-
-    expires_str = ""
-    if expiry:
-        try:
-            expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            expires_str = f"⏳ Free until: {expiry_dt.strftime('%B %d, %Y at %I:%M %p UTC')}\n\n"
-        except (ValueError, TypeError):
-            pass
-
-    price_str = f"💰 Original Price: {original}\n" if original else "💰 100% Discount (Free)\n"
-    desc_str = f"{desc}\n\n" if desc else ""
-
-    message = (
-        f"🎮 <b>New Free PC Game on Xbox! (100% Off)</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"{desc_str}"
-        f"{price_str}"
-        f"{expires_str}"
-        f"<a href='{claim_url}'>Claim Now</a>"
-    )
-
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
+    _generic_free_game(game, "Xbox", "New Free PC Game on Xbox! (100% Off)")
 
 
 def send_telegram_deal(deal: dict, store_name: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = deal["title"]
-    desc = deal.get("description", "")
-    if desc:
-        desc = desc[:200] + ("…" if len(desc) > 200 else "")
-
-    original = deal.get("original_price", "")
-    discounted = deal.get("discounted_price", "")
-    pct = deal.get("discount_pct", "90%+")
-    claim_url = deal.get("claim_url", "")
-    thumbnail = deal.get("thumbnail", "")
+    desc = _truncate_desc(deal.get("description", ""))
+    pct = _escape(deal.get("discount_pct", "90%+"))
+    original = _escape(deal.get("original_price", ""))
+    discounted = _escape(deal.get("discounted_price", ""))
 
     price_line = (
         f"💰 Original Price: <s>{original}</s>\n"
         f"🏷️ Deal Price: <b>{discounted}</b> ({pct} Off)\n\n"
     ) if original else f"🏷️ Deal Price: <b>{discounted}</b> ({pct} Off)\n\n"
-    desc_str = f"{desc}\n\n" if desc else ""
 
     message = (
-        f"🔥 <b>Steep Deal on {store_name}! ({pct} Off)</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"{desc_str}"
-        f"{price_line}"
-        f"<a href='{claim_url}'>Get Deal Now</a>"
+        f"🔥 <b>Steep Deal on {_escape(store_name)}! ({pct} Off)</b>\n\n"
+        f"<b>{_escape(deal['title'])}</b>\n"
+        + (f"{desc}\n\n" if desc else "")
+        + price_line
+        + f"<a href='{deal.get('claim_url', '')}'>Get Deal Now</a>"
     )
-
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
+    _deliver(deal.get("thumbnail", ""), message)
 
 
 def send_telegram_key_drop(drop: dict, platform_name: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification")
-        return
-
-    title = drop["title"]
     desc = drop.get("description", "")
-    claim_url = drop.get("claim_url", "")
-    thumbnail = drop.get("thumbnail", "")
-
     message = (
-        f"🎁 <b>New Game Key Drop on {platform_name}!</b>\n\n"
-        f"<b>{title}</b>\n"
+        f"🎁 <b>New Game Key Drop on {_escape(platform_name)}!</b>\n\n"
+        f"<b>{_escape(drop['title'])}</b>\n"
         f"{desc}\n\n"
         f"🆓 <b>100% Free Key Drop</b> (Limited Quantity)\n\n"
-        f"<a href='{claim_url}'>Claim Key Now</a>"
+        f"<a href='{drop.get('claim_url', '')}'>Claim Key Now</a>"
     )
+    _deliver(drop.get("thumbnail", ""), message)
 
-    if _send_photo(thumbnail, message):
-        return
-    _send_text(message)
 
+# ---------------------------------------------------------------------------
+# Source registry
+# ---------------------------------------------------------------------------
+
+# kind: "game" (tracked_games), "deal" (tracked_deals), "key_drop" (tracked_key_drops)
+# send_fn signature: game -> (item); deal/key_drop -> (item, store_name)
+SOURCES: list[dict[str, Any]] = [
+    {"name": "Epic Games",  "platform": "epic",   "kind": "game",     "fetch": get_epic_free_games,      "send": send_telegram_epic},
+    {"name": "Amazon Luna", "platform": "luna",   "kind": "game",     "fetch": get_luna_free_games,      "send": send_telegram_luna},
+    {"name": "itch.io",     "platform": "itch",   "kind": "game",     "fetch": get_itch_free_games,      "send": send_telegram_itch},
+    {"name": "STOVE Store", "platform": "stove",  "kind": "game",     "fetch": get_stove_free_games,     "send": send_telegram_stove},
+    {"name": "Steam",       "platform": "steam",  "kind": "game",     "fetch": get_steam_free_games,     "send": send_telegram_steam},
+    {"name": "Xbox (PC)",   "platform": "xbox",   "kind": "game",     "fetch": get_xbox_free_games,      "send": send_telegram_xbox},
+    {"name": "Steam",       "platform": "steam",  "kind": "deal",     "fetch": get_steam_discount_deals, "send": send_telegram_deal},
+    {"name": "Epic Games",  "platform": "epic",   "kind": "deal",     "fetch": get_epic_discount_deals,  "send": send_telegram_deal},
+    {"name": "Xbox (PC)",   "platform": "xbox",   "kind": "deal",     "fetch": get_xbox_discount_deals,  "send": send_telegram_deal},
+    {"name": "Lenovo Legion", "platform": "lenovo", "kind": "key_drop", "fetch": get_lenovo_key_drops,   "send": send_telegram_key_drop},
+]
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def _send_alert(message: str) -> None:
+    if DRY_RUN:
+        print(f"  [dry-run] Would send alert: {message}", file=sys.stderr)
+        return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -1487,171 +1461,181 @@ def _send_alert(message: str) -> None:
         pass
 
 
-def check_source(name: str, fetch_fn, send_fn, platform: str) -> int:
-    print(f"\n[{datetime.now().isoformat()}] Checking {name} free games…")
+def _load_known_ids(kind: str, platform: str) -> set[str]:
+    if kind == "game":
+        return db.load_known_game_ids(platform)
+    if kind == "deal":
+        return db.load_known_deal_ids(platform)
+    return db.load_known_key_drop_ids(platform)
 
-    known_ids = db.load_known_game_ids(platform)
-    print(f"  [DB tracked_games] Known {name} games count: {len(known_ids)}")
+
+def _save_items(kind: str, platform: str, items: list[dict]) -> None:
+    if kind == "game":
+        db.save_games(platform, items)
+    elif kind == "deal":
+        db.save_deals(platform, items)
+    else:
+        db.save_key_drops(platform, items)
+
+
+def check_source(name: str, kind: str, fetch_fn, send_fn, platform: str, dry_run: bool = False) -> tuple[int, bool]:
+    """Check one source; returns (notifications_sent, ok)."""
+    label = {"game": "free games", "deal": "90%+ discount deals", "key_drop": "Key Drops"}[kind]
+    print(f"\n[{datetime.now().isoformat()}] Checking {name} {label}…")
+
+    known_ids = _load_known_ids(kind, platform)
+    print(f"  [DB] Known {name} {label} count: {len(known_ids)}")
 
     try:
         current = fetch_fn()
     except Exception as e:
-        print(f"  ❌ Failed to fetch {name}: {e}", file=sys.stderr)
-        _send_alert(f"Failed to fetch {name} free games:\n<code>{e}</code>")
-        return 0
+        print(f"  ❌ Failed to fetch {name} {label}: {e}", file=sys.stderr)
+        _send_alert(f"Failed to fetch {name} {label}:\n<code>{e}</code>")
+        return 0, False
 
     if current is None:
-        print(f"  ❌ {name} fetch returned no data (possible API change)", file=sys.stderr)
+        print(f"  ❌ {name} {label} fetch returned no data (possible API change)", file=sys.stderr)
         _send_alert(
-            f"{name} fetch returned no data.\n"
+            f"{name} {label} fetch returned no data.\n"
             "The API endpoint may have changed or is unreachable."
         )
-        return 0
+        return 0, False
+
+    if kind == "deal":
+        print(f"  Current 90%+ deals: {[d['title'] + ' (' + d['discount_pct'] + ')' for d in current]}")
+    else:
+        print(f"  Current items: {[g['title'] for g in current]}")
 
     current_ids = {g["id"] for g in current}
-    print(f"  Current free games: {[g['title'] for g in current]}")
-
     new_ids = current_ids - known_ids
     notified = 0
     if new_ids:
-        print(f"  New free games detected: {new_ids}")
-        for game in current:
-            if game["id"] in new_ids:
-                print(f"  Notifying about: {game['title']}")
+        print(f"  New items detected: {new_ids}")
+        for item in current:
+            if item["id"] in new_ids:
+                print(f"  Notifying about: {item['title']}")
+                if dry_run:
+                    print("  [dry-run] Skipped notification.")
+                    notified += 1
+                    continue
                 try:
-                    send_fn(game)
-                    print(f"  ✅ Notification sent for {game['title']}")
+                    if kind == "game":
+                        send_fn(item)
+                    else:
+                        send_fn(item, name)
+                    print(f"  ✅ Notification sent for {item['title']}")
                     notified += 1
                 except Exception as e:
                     print(f"  ❌ Failed to send notification: {e}", file=sys.stderr)
     else:
-        print("  No new free games found.")
+        print("  No new items found.")
 
-    db.save_games(platform, current)
-    print(f"  [DB tracked_games] Saved active {name} games to database.")
-
-    return notified
-
-
-def check_deal_source(name: str, fetch_fn, send_fn, platform: str) -> int:
-    print(f"\n[{datetime.now().isoformat()}] Checking {name} 90%+ discount deals…")
-
-    known_ids = db.load_known_deal_ids(platform)
-    print(f"  [DB tracked_deals] Known {name} deal count: {len(known_ids)}")
-
-    try:
-        current = fetch_fn()
-    except Exception as e:
-        print(f"  ❌ Failed to fetch {name} deals: {e}", file=sys.stderr)
-        _send_alert(f"Failed to fetch {name} deals:\n<code>{e}</code>")
-        return 0
-
-    if current is None:
-        print(f"  ❌ {name} deals fetch returned no data", file=sys.stderr)
-        return 0
-
-    current_ids = {d["id"] for d in current}
-    print(f"  Current 90%+ deals: {[d['title'] + ' (' + d['discount_pct'] + ')' for d in current]}")
-
-    new_ids = current_ids - known_ids
-    notified = 0
-    if new_ids:
-        print(f"  New 90%+ deals detected: {new_ids}")
-        for deal in current:
-            if deal["id"] in new_ids:
-                print(f"  Notifying about deal: {deal['title']} ({deal['discount_pct']})")
-                try:
-                    send_fn(deal, name)
-                    print(f"  ✅ Notification sent for deal: {deal['title']}")
-                    notified += 1
-                except Exception as e:
-                    print(f"  ❌ Failed to send deal notification: {e}", file=sys.stderr)
+    if dry_run:
+        print("  [dry-run] Skipped saving items to database.")
     else:
-        print("  No new 90%+ deals found.")
+        _save_items(kind, platform, current)
+        print(f"  [DB] Saved active {name} {label} to database.")
 
-    db.save_deals(platform, current)
-    print(f"  [DB tracked_deals] Saved active {name} deals to database.")
-
-    return notified
+    return notified, True
 
 
-def check_key_drop_source(name: str, fetch_fn, send_fn, platform: str) -> int:
-    print(f"\n[{datetime.now().isoformat()}] Checking {name} Key Drops…")
+def run_sources(selected: list[dict[str, Any]] | None = None, dry_run: bool = False) -> int:
+    """Run all (or selected) source checks concurrently; returns total notifications sent, or -1 if all sources failed."""
+    sources = selected if selected is not None else SOURCES
+    total = 0
+    ok_count = 0
 
-    known_ids = db.load_known_key_drop_ids(platform)
-    print(f"  [DB tracked_key_drops] Known {name} key drop count: {len(known_ids)}")
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        futures = {
+            pool.submit(
+                check_source,
+                s["name"], s["kind"], s["fetch"], s["send"], s["platform"], dry_run,
+            ): s
+            for s in sources
+        }
+        for fut, s in futures.items():
+            try:
+                notified, ok = fut.result()
+                total += notified
+                if ok:
+                    ok_count += 1
+            except Exception as e:
+                print(f"  ❌ Unexpected error checking {s['name']} ({s['kind']}): {e}", file=sys.stderr)
 
-    try:
-        current = fetch_fn()
-    except Exception as e:
-        print(f"  ❌ Failed to fetch {name} key drops: {e}", file=sys.stderr)
-        _send_alert(f"Failed to fetch {name} key drops:\n<code>{e}</code>")
-        return 0
+    if ok_count == 0:
+        print(f"❌ All {len(sources)} source checks failed.", file=sys.stderr)
+        return -1
 
-    if current is None:
-        print(f"  ❌ {name} key drops fetch returned no data", file=sys.stderr)
-        return 0
-
-    current_ids = {d["id"] for d in current}
-    print(f"  Current key drops: {[d['title'] for d in current]}")
-
-    new_ids = current_ids - known_ids
-    notified = 0
-    if new_ids:
-        print(f"  New key drops detected: {new_ids}")
-        for drop in current:
-            if drop["id"] in new_ids:
-                print(f"  Notifying about key drop: {drop['title']}")
-                try:
-                    send_fn(drop, name)
-                    print(f"  ✅ Notification sent for key drop: {drop['title']}")
-                    notified += 1
-                except Exception as e:
-                    print(f"  ❌ Failed to send key drop notification: {e}", file=sys.stderr)
-    else:
-        print("  No new key drops found.")
-
-    db.save_key_drops(platform, current)
-    print(f"  [DB tracked_key_drops] Saved active {name} key drops to database.")
-
-    return notified
+    return total
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
-    if not db.is_db_enabled():
+    parser = argparse.ArgumentParser(description="Check stores for free games & steep deals, notify via Telegram.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and diff but skip Telegram notifications and DB writes.",
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="PLATFORM",
+        help="Only check the given platform (repeatable): epic, luna, itch, stove, steam, xbox, lenovo.",
+    )
+    parser.add_argument(
+        "--list-sources",
+        action="store_true",
+        help="List available platforms and exit.",
+    )
+    args = parser.parse_args(argv)
+
+    global DRY_RUN
+    DRY_RUN = args.dry_run
+
+    if args.list_sources:
+        for s in SOURCES:
+            print(f"{s['platform']:8} {s['kind']:8} {s['name']}")
+        return 0
+
+    selected = None
+    if args.source:
+        wanted = {p.lower() for p in args.source}
+        known = {s["platform"] for s in SOURCES}
+        unknown = wanted - known
+        if unknown:
+            print(f"❌ Unknown platform(s): {', '.join(sorted(unknown))}. "
+                  f"Available: {', '.join(sorted(known))}", file=sys.stderr)
+            return 2
+        selected = [s for s in SOURCES if s["platform"] in wanted]
+
+    db.init_db()
+
+    if not args.dry_run and not db.is_db_enabled():
         err_msg = "NeonDB is not configured or DATABASE_URL environment variable is missing."
         print(f"❌ {err_msg}", file=sys.stderr)
         _send_alert(f"<b>NeonDB Not Configured</b>\n\n{err_msg}\nPlease set <code>DATABASE_URL</code> in environment / GitHub Secrets.")
         return 1
 
-    total = 0
-    # Free games (100% off)
-    total += check_source("Epic Games", get_epic_free_games, send_telegram_epic, "epic")
-    total += check_source("Amazon Luna", get_luna_free_games, send_telegram_luna, "luna")
-    total += check_source("itch.io", get_itch_free_games, send_telegram_itch, "itch")
-    total += check_source("STOVE Store", get_stove_free_games, send_telegram_stove, "stove")
-    total += check_source("Steam", get_steam_free_games, send_telegram_steam, "steam")
-    total += check_source("Xbox (PC)", get_xbox_free_games, send_telegram_xbox, "xbox")
+    total = run_sources(selected, dry_run=args.dry_run)
 
-    # 90%+ Discount Deals (separate tracked_deals DB table)
-    total += check_deal_source("Steam", get_steam_discount_deals, send_telegram_deal, "steam")
-    total += check_deal_source("Epic Games", get_epic_discount_deals, send_telegram_deal, "epic")
-    total += check_deal_source("Xbox (PC)", get_xbox_discount_deals, send_telegram_deal, "xbox")
+    db.close_connection()
 
-    # Key Drops (separate tracked_key_drops DB table)
-    total += check_key_drop_source("Lenovo Legion", get_lenovo_key_drops, send_telegram_key_drop, "lenovo")
+    if total < 0:
+        return 1
 
     if total == 0:
-        send_telegram_no_new_games()
+        if DRY_RUN:
+            print("  [dry-run] Would send 'No new free games today' notification.")
+        else:
+            send_telegram_no_new_games()
 
     return 0
-
-
 
 
 if __name__ == "__main__":
