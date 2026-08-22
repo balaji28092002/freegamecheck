@@ -74,7 +74,7 @@ CREATE INDEX IF NOT EXISTS idx_tracked_key_drops_platform ON tracked_key_drops(p
 UPSERT_GAMES_BATCH_SQL = """
 INSERT INTO tracked_games (
     id, platform, title, description, claim_url, thumbnail,
-    original_price, currency, expiry, raw_data, updated_at
+    original_price, currency, expiry, raw_data
 ) VALUES %s
 ON CONFLICT (id) DO UPDATE SET
     title = EXCLUDED.title,
@@ -91,7 +91,7 @@ ON CONFLICT (id) DO UPDATE SET
 UPSERT_DEALS_BATCH_SQL = """
 INSERT INTO tracked_deals (
     id, platform, title, description, claim_url, thumbnail,
-    original_price, discounted_price, discount_pct, currency, expiry, raw_data, updated_at
+    original_price, discounted_price, discount_pct, currency, expiry, raw_data
 ) VALUES %s
 ON CONFLICT (id) DO UPDATE SET
     title = EXCLUDED.title,
@@ -110,7 +110,7 @@ ON CONFLICT (id) DO UPDATE SET
 UPSERT_KEY_DROPS_BATCH_SQL = """
 INSERT INTO tracked_key_drops (
     id, platform, title, description, claim_url, thumbnail,
-    expiry, raw_data, updated_at
+    expiry, raw_data
 ) VALUES %s
 ON CONFLICT (id) DO UPDATE SET
     title = EXCLUDED.title,
