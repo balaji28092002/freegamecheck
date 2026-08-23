@@ -141,7 +141,7 @@ def is_db_enabled() -> bool:
 
 
 def get_connection():
-    """Establish connection to PostgreSQL/Neon DB."""
+    """Establish connection to PostgreSQL/Neon DB with TCP keepalives to prevent idle disconnects."""
     if not HAS_PSYCOPG2:
         raise RuntimeError("psycopg2 package is required to connect to PostgreSQL database.")
 
@@ -149,11 +149,17 @@ def get_connection():
     if not db_url:
         raise ValueError("DATABASE_URL environment variable is not set.")
 
-    return psycopg2.connect(db_url)
+    return psycopg2.connect(
+        db_url,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
 
 
 def _shared_connection():
-    """Return the run-wide connection, reconnecting if it was closed."""
+    """Return the run-wide connection, reconnecting if it was closed or not established."""
     global _conn
     if _conn is None or _conn.closed:
         _conn = get_connection()
@@ -186,26 +192,41 @@ def close_connection() -> None:
         _reset_connection()
 
 
+def _execute_with_retry(operation: str, query_fn, max_retries: int = 3, default=None):
+    """Execute a query with auto-reconnection and retry on connection/database failures."""
+    with _DB_LOCK:
+        for attempt in range(1, max_retries + 1):
+            try:
+                conn = _shared_connection()
+                result = query_fn(conn)
+                conn.commit()
+                return result
+            except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.DatabaseError) as e:
+                _report_failure(f"{operation} (attempt {attempt}/{max_retries})", e)
+                if attempt == max_retries:
+                    return default
+            except Exception as e:
+                _report_failure(operation, e)
+                return default
+        return default
+
+
 def init_db() -> None:
     """Create tracked_games, tracked_deals, and tracked_key_drops tables and indexes once per run."""
     global _db_initialized
     if not is_db_enabled() or _db_initialized:
         return
 
-    with _DB_LOCK:
-        if _db_initialized:
-            return
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                cur.execute(CREATE_TABLE_SQL)
-                cur.execute(CREATE_DEALS_TABLE_SQL)
-                cur.execute(CREATE_KEY_DROPS_TABLE_SQL)
-                cur.execute(PURGE_OLD_DEALS_SQL)
-            conn.commit()
-            _db_initialized = True
-        except Exception as e:
-            _report_failure("initialize database", e)
+    def _query(conn):
+        global _db_initialized
+        with conn.cursor() as cur:
+            cur.execute(CREATE_TABLE_SQL)
+            cur.execute(CREATE_DEALS_TABLE_SQL)
+            cur.execute(CREATE_KEY_DROPS_TABLE_SQL)
+            cur.execute(PURGE_OLD_DEALS_SQL)
+        _db_initialized = True
+
+    _execute_with_retry("initialize database", _query)
 
 
 def load_known_game_ids(platform: str) -> set[str]:
@@ -213,17 +234,14 @@ def load_known_game_ids(platform: str) -> set[str]:
     if not is_db_enabled():
         return set()
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM tracked_games WHERE platform = %s;", (platform,))
-                rows = cur.fetchall()
-            conn.commit()
-            return {row[0] for row in rows}
-        except Exception as e:
-            _report_failure("query known game IDs from DB", e)
-            return set()
+    def _query(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM tracked_games WHERE platform = %s;", (platform,))
+            rows = cur.fetchall()
+        return {row[0] for row in rows}
+
+    res = _execute_with_retry("query known game IDs from DB", _query, default=set())
+    return res if res is not None else set()
 
 
 def load_known_deal_ids(platform: str) -> set[str]:
@@ -231,17 +249,14 @@ def load_known_deal_ids(platform: str) -> set[str]:
     if not is_db_enabled():
         return set()
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM tracked_deals WHERE platform = %s;", (platform,))
-                rows = cur.fetchall()
-            conn.commit()
-            return {row[0] for row in rows}
-        except Exception as e:
-            _report_failure("query known deal IDs from DB", e)
-            return set()
+    def _query(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM tracked_deals WHERE platform = %s;", (platform,))
+            rows = cur.fetchall()
+        return {row[0] for row in rows}
+
+    res = _execute_with_retry("query known deal IDs from DB", _query, default=set())
+    return res if res is not None else set()
 
 
 def load_known_key_drop_ids(platform: str) -> set[str]:
@@ -249,17 +264,14 @@ def load_known_key_drop_ids(platform: str) -> set[str]:
     if not is_db_enabled():
         return set()
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM tracked_key_drops WHERE platform = %s;", (platform,))
-                rows = cur.fetchall()
-            conn.commit()
-            return {row[0] for row in rows}
-        except Exception as e:
-            _report_failure("query known key drop IDs from DB", e)
-            return set()
+    def _query(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM tracked_key_drops WHERE platform = %s;", (platform,))
+            rows = cur.fetchall()
+        return {row[0] for row in rows}
+
+    res = _execute_with_retry("query known key drop IDs from DB", _query, default=set())
+    return res if res is not None else set()
 
 
 def purge_old_deals() -> None:
@@ -267,14 +279,11 @@ def purge_old_deals() -> None:
     if not is_db_enabled():
         return
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                cur.execute(PURGE_OLD_DEALS_SQL)
-            conn.commit()
-        except Exception as e:
-            _report_failure("purge old deals from DB", e)
+    def _query(conn):
+        with conn.cursor() as cur:
+            cur.execute(PURGE_OLD_DEALS_SQL)
+
+    _execute_with_retry("purge old deals from DB", _query)
 
 
 def _parse_expiry(raw_expiry: Any) -> Optional[datetime]:
@@ -368,14 +377,11 @@ def save_games(platform: str, games: list[dict[str, Any]]) -> None:
         for p in (_prepare_game_params(platform, g) for g in games)
     ]
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                execute_values(cur, UPSERT_GAMES_BATCH_SQL, tuples)
-            conn.commit()
-        except Exception as e:
-            _report_failure("save games to DB", e)
+    def _query(conn):
+        with conn.cursor() as cur:
+            execute_values(cur, UPSERT_GAMES_BATCH_SQL, tuples)
+
+    _execute_with_retry(f"save {len(games)} games for {platform} to DB", _query)
 
 
 def save_deals(platform: str, deals: list[dict[str, Any]]) -> None:
@@ -394,14 +400,11 @@ def save_deals(platform: str, deals: list[dict[str, Any]]) -> None:
         for p in (_prepare_deal_params(platform, d) for d in deals)
     ]
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                execute_values(cur, UPSERT_DEALS_BATCH_SQL, tuples)
-            conn.commit()
-        except Exception as e:
-            _report_failure("save deals to DB", e)
+    def _query(conn):
+        with conn.cursor() as cur:
+            execute_values(cur, UPSERT_DEALS_BATCH_SQL, tuples)
+
+    _execute_with_retry(f"save {len(deals)} deals for {platform} to DB", _query)
 
 
 def save_key_drops(platform: str, drops: list[dict[str, Any]]) -> None:
@@ -419,11 +422,8 @@ def save_key_drops(platform: str, drops: list[dict[str, Any]]) -> None:
         for p in (_prepare_key_drop_params(platform, d) for d in drops)
     ]
 
-    with _DB_LOCK:
-        try:
-            conn = _shared_connection()
-            with conn.cursor() as cur:
-                execute_values(cur, UPSERT_KEY_DROPS_BATCH_SQL, tuples)
-            conn.commit()
-        except Exception as e:
-            _report_failure("save key drops to DB", e)
+    def _query(conn):
+        with conn.cursor() as cur:
+            execute_values(cur, UPSERT_KEY_DROPS_BATCH_SQL, tuples)
+
+    _execute_with_retry(f"save {len(drops)} key drops for {platform} to DB", _query)
