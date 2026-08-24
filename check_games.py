@@ -195,10 +195,10 @@ _EPIC_FETCH_LOCK = threading.Lock()
 def _extract_epic_slug(el: dict) -> str:
     mappings = (el.get("catalogNs") or {}).get("mappings") or []
     for m in mappings:
-        if m.get("pageSlug") and m.get("pageType") == "productHome":
+        if isinstance(m, dict) and m.get("pageSlug") and m.get("pageType") == "productHome":
             return m["pageSlug"]
     for m in mappings:
-        if m.get("pageSlug"):
+        if isinstance(m, dict) and m.get("pageSlug"):
             return m["pageSlug"]
 
     pslug = el.get("productSlug")
@@ -226,27 +226,36 @@ def _fetch_epic_data_unlocked() -> bool:
     discount_deals = []
     seen_free = set()
     seen_deals = set()
+    success_count = 0
 
     # 1. Fetch official curated weekly free games from Epic promotions API
     try:
         resp = requests.get(EPIC_API_URL, timeout=DEFAULT_REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        elements = data["data"]["Catalog"]["searchStore"]["elements"]
+        elements = (
+            ((data.get("data") or {}).get("Catalog") or {}).get("searchStore") or {}
+        ).get("elements") or []
         for el in elements:
+            if not isinstance(el, dict):
+                continue
             try:
-                price = el.get("price", {}) or {}
-                total = price.get("totalPrice", {}) or {}
+                price = el.get("price") or {}
+                total = price.get("totalPrice") or {}
                 if total.get("discountPrice") != 0:
                     continue
 
-                promotions = el.get("promotions", {}) or {}
-                active = promotions.get("promotionalOffers", []) or []
+                promotions = el.get("promotions") or {}
+                active = promotions.get("promotionalOffers") or []
                 is_active_free = False
                 expiry = None
                 for offer_group in active:
-                    for offer in offer_group.get("promotionalOffers", []) or []:
-                        discount = offer.get("discountSetting", {}) or {}
+                    if not isinstance(offer_group, dict):
+                        continue
+                    for offer in (offer_group.get("promotionalOffers") or []):
+                        if not isinstance(offer, dict):
+                            continue
+                        discount = offer.get("discountSetting") or {}
                         if discount.get("discountPercentage") != 0:
                             continue
                         end = offer.get("endDate")
@@ -263,12 +272,12 @@ def _fetch_epic_data_unlocked() -> bool:
                         slug = _extract_epic_slug(el)
                         claim_url = f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/free-games"
 
-                        images = el.get("keyImages", []) or []
+                        images = el.get("keyImages") or []
                         thumbnail = ""
                         for img_type in ("Thumbnail", "OfferImageTall", "OfferImageWide"):
                             for img in images:
-                                if img.get("type") == img_type:
-                                    thumbnail = img.get("url", "")
+                                if isinstance(img, dict) and img.get("type") == img_type:
+                                    thumbnail = img.get("url") or ""
                                     break
                             if thumbnail:
                                 break
@@ -276,155 +285,171 @@ def _fetch_epic_data_unlocked() -> bool:
                         free_games.append({
                             "id": game_id,
                             "title": el.get("title", "Unknown Game"),
-                            "description": el.get("description", ""),
-                            "original_price": total.get("fmtPrice", {}).get("originalPrice", ""),
-                            "currency": total.get("currencyCode", "INR"),
+                            "description": el.get("description") or "",
+                            "original_price": (total.get("fmtPrice") or {}).get("originalPrice") or "",
+                            "currency": total.get("currencyCode") or "INR",
                             "claim_url": claim_url,
                             "thumbnail": thumbnail,
                             "product_slug": slug,
-                            "url_slug": el.get("urlSlug", ""),
+                            "url_slug": el.get("urlSlug") or "",
                             "expiry": expiry,
                             "key_images": images,
                         })
             except Exception as e:
                 print(f"  ⚠️ Skipping malformed Epic promotional entry: {e}", file=sys.stderr)
                 continue
+        success_count += 1
     except Exception as e:
         print(f"  ⚠️ Failed to fetch Epic promotions API: {e}", file=sys.stderr)
 
     # 2. Fetch full storewide on-sale catalog via GraphQL (handles 100% off sales & 90%+ discount deals)
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": STEAM_USER_AGENT,
-        "Content-Type": "application/json",
-    })
-    start = 0
-    while True:
-        variables = {
-            "allowCountries": "IN",
-            "category": "games/edition/base",
-            "count": EPIC_CATALOG_PAGE_SIZE,
-            "country": "IN",
-            "locale": "en-US",
-            "sortBy": "releaseDate",
-            "sortDir": "DESC",
-            "start": start,
-            "onSale": True
-        }
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": STEAM_USER_AGENT,
+            "Content-Type": "application/json",
+        })
+        start = 0
+        while True:
+            variables = {
+                "allowCountries": "IN",
+                "category": "games/edition/base",
+                "count": EPIC_CATALOG_PAGE_SIZE,
+                "country": "IN",
+                "locale": "en-US",
+                "sortBy": "releaseDate",
+                "sortDir": "DESC",
+                "start": start,
+                "onSale": True
+            }
 
-        try:
-            resp = session.post(
-                EPIC_GRAPHQL_URL,
-                json={"query": EPIC_CATALOG_ON_SALE_QUERY, "variables": variables},
-                timeout=EPIC_CATALOG_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"  ⚠️ Failed to fetch Epic GraphQL catalog (start {start}): {e}", file=sys.stderr)
-            break
-        except json.JSONDecodeError as e:
-            print(f"  ⚠️ Invalid JSON from Epic GraphQL catalog (start {start}): {e}", file=sys.stderr)
-            break
-
-        try:
-            store_data = data["data"]["Catalog"]["searchStore"]
-            elements = store_data.get("elements", [])
-            total_store = store_data.get("paging", {}).get("total", 0)
-        except (KeyError, TypeError) as e:
-            print(f"  ⚠️ Unexpected Epic GraphQL response structure: {e}", file=sys.stderr)
-            break
-
-        if not elements:
-            break
-
-        for el in elements:
             try:
-                game_id = el.get("id")
-                if not game_id:
+                resp = session.post(
+                    EPIC_GRAPHQL_URL,
+                    json={"query": EPIC_CATALOG_ON_SALE_QUERY, "variables": variables},
+                    timeout=EPIC_CATALOG_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.RequestException as e:
+                print(f"  ⚠️ Failed to fetch Epic GraphQL catalog (start {start}): {e}", file=sys.stderr)
+                break
+            except json.JSONDecodeError as e:
+                print(f"  ⚠️ Invalid JSON from Epic GraphQL catalog (start {start}): {e}", file=sys.stderr)
+                break
+
+            try:
+                catalog = (data.get("data") or {}).get("Catalog") or {}
+                store_data = catalog.get("searchStore") or {}
+                elements = store_data.get("elements") or []
+                paging = store_data.get("paging") or {}
+                total_store = paging.get("total", 0) or 0
+            except Exception as e:
+                print(f"  ⚠️ Unexpected Epic GraphQL response structure: {e}", file=sys.stderr)
+                break
+
+            if not elements:
+                break
+
+            for el in elements:
+                if not isinstance(el, dict):
                     continue
+                try:
+                    game_id = el.get("id")
+                    if not game_id:
+                        continue
 
-                price = el.get("price", {}) or {}
-                total_price = price.get("totalPrice", {}) or {}
-                orig = total_price.get("originalPrice", 0)
-                disc = total_price.get("discountPrice", 0)
+                    price = el.get("price") or {}
+                    total_price = price.get("totalPrice") or {}
+                    orig = total_price.get("originalPrice", 0) or 0
+                    disc = total_price.get("discountPrice", 0) or 0
 
-                if orig <= 0:
-                    continue
+                    if orig <= 0:
+                        continue
 
-                slug = _extract_epic_slug(el)
-                claim_url = f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/"
+                    slug = _extract_epic_slug(el)
+                    claim_url = f"https://store.epicgames.com/en-US/p/{slug}" if slug else "https://store.epicgames.com/en-US/"
 
-                images = el.get("keyImages", []) or []
-                thumbnail = ""
-                for img_type in ("Thumbnail", "OfferImageTall", "OfferImageWide"):
-                    for img in images:
-                        if img.get("type") == img_type:
-                            thumbnail = img.get("url", "")
-                            break
-                    if thumbnail:
-                        break
-
-                fmt = total_price.get("fmtPrice", {}) or {}
-                orig_fmt = fmt.get("originalPrice", f"₹{orig/100:.2f}")
-                disc_fmt = fmt.get("discountPrice", f"₹{disc/100:.2f}")
-
-                promotions = el.get("promotions", {}) or {}
-                active = promotions.get("promotionalOffers", []) or []
-                expiry = None
-                for offer_group in active:
-                    for offer in offer_group.get("promotionalOffers", []) or []:
-                        end = offer.get("endDate")
-                        if end:
-                            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                            if end_dt > now:
-                                expiry = end
+                    images = el.get("keyImages") or []
+                    thumbnail = ""
+                    for img_type in ("Thumbnail", "OfferImageTall", "OfferImageWide"):
+                        for img in images:
+                            if isinstance(img, dict) and img.get("type") == img_type:
+                                thumbnail = img.get("url") or ""
                                 break
-                    if expiry:
-                        break
+                        if thumbnail:
+                            break
 
-                # 100% OFF Storewide Promotion (Free Game)
-                if disc == 0:
-                    if game_id not in seen_free:
-                        seen_free.add(game_id)
-                        free_games.append({
-                            "id": game_id,
-                            "title": el.get("title", "Unknown Game"),
-                            "description": el.get("description", ""),
-                            "original_price": orig_fmt,
-                            "currency": "INR",
-                            "claim_url": claim_url,
-                            "thumbnail": thumbnail,
-                            "product_slug": slug,
-                            "url_slug": el.get("urlSlug", ""),
-                            "expiry": expiry,
-                            "key_images": images,
-                        })
-                # 90%+ Discount Deal
-                elif disc < orig:
-                    pct = int(round((1 - disc / orig) * 100))
-                    if DISCOUNT_DEAL_MIN_PCT <= pct <= DISCOUNT_DEAL_MAX_PCT:
-                        if game_id not in seen_deals:
-                            seen_deals.add(game_id)
-                            discount_deals.append({
-                                "id": f"epic_deal_{month_prefix}_{game_id}",
+                    fmt = total_price.get("fmtPrice") or {}
+                    orig_fmt = fmt.get("originalPrice") or f"₹{orig/100:.2f}"
+                    disc_fmt = fmt.get("discountPrice") or f"₹{disc/100:.2f}"
+
+                    promotions = el.get("promotions") or {}
+                    active = promotions.get("promotionalOffers") or []
+                    expiry = None
+                    for offer_group in active:
+                        if not isinstance(offer_group, dict):
+                            continue
+                        for offer in (offer_group.get("promotionalOffers") or []):
+                            if not isinstance(offer, dict):
+                                continue
+                            end = offer.get("endDate")
+                            if end:
+                                end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                if end_dt > now:
+                                    expiry = end
+                                    break
+                        if expiry:
+                            break
+
+                    # 100% OFF Storewide Promotion (Free Game)
+                    if disc == 0:
+                        if game_id not in seen_free:
+                            seen_free.add(game_id)
+                            free_games.append({
+                                "id": game_id,
                                 "title": el.get("title", "Unknown Game"),
-                                "description": el.get("description", ""),
+                                "description": el.get("description") or "",
+                                "original_price": orig_fmt,
+                                "currency": "INR",
                                 "claim_url": claim_url,
                                 "thumbnail": thumbnail,
-                                "original_price": orig_fmt,
-                                "discounted_price": disc_fmt,
-                                "discount_pct": f"{pct}%",
-                                "currency": "INR",
+                                "product_slug": slug,
+                                "url_slug": el.get("urlSlug") or "",
                                 "expiry": expiry,
+                                "key_images": images,
                             })
-            except Exception as e:
-                print(f"  ⚠️ Skipping malformed Epic on-sale catalog entry: {e}", file=sys.stderr)
-                continue
+                    # 90%+ Discount Deal
+                    elif disc < orig:
+                        pct = int(round((1 - disc / orig) * 100))
+                        if DISCOUNT_DEAL_MIN_PCT <= pct <= DISCOUNT_DEAL_MAX_PCT:
+                            if game_id not in seen_deals:
+                                seen_deals.add(game_id)
+                                discount_deals.append({
+                                    "id": f"epic_deal_{month_prefix}_{game_id}",
+                                    "title": el.get("title", "Unknown Game"),
+                                    "description": el.get("description") or "",
+                                    "claim_url": claim_url,
+                                    "thumbnail": thumbnail,
+                                    "original_price": orig_fmt,
+                                    "discounted_price": disc_fmt,
+                                    "discount_pct": f"{pct}%",
+                                    "currency": "INR",
+                                    "expiry": expiry,
+                                })
+                except Exception as e:
+                    print(f"  ⚠️ Skipping malformed Epic on-sale catalog entry: {e}", file=sys.stderr)
+                    continue
 
-        start += len(elements)
-        if start >= total_store:
-            break
+            start += len(elements)
+            if start >= total_store:
+                break
+        success_count += 1
+    except Exception as e:
+        print(f"  ⚠️ Failed to fetch Epic GraphQL catalog: {e}", file=sys.stderr)
+
+    if success_count == 0:
+        return False
 
     _epic_cache["fetched"] = True
     _epic_cache["free_games"] = free_games
@@ -498,34 +523,36 @@ def get_luna_free_games() -> list[dict] | None:
         return None
 
     try:
-        items = data["data"]["games"]["items"]
-    except (KeyError, TypeError) as e:
+        items = ((data.get("data") or {}).get("games") or {}).get("items") or []
+    except Exception as e:
         print(f"  ⚠️ Unexpected Luna GraphQL response structure: {e}", file=sys.stderr)
         return None
 
     free = []
     for item in items:
+        if not isinstance(item, dict):
+            continue
         try:
             if not item.get("isFGWP"):
                 continue
 
-            assets = item.get("assets", {}) or {}
+            assets = item.get("assets") or {}
             title = assets.get("title", "")
             if not title:
                 continue
 
-            card_media = assets.get("cardMedia", {}) or {}
-            default_media = card_media.get("defaultMedia", {}) or {}
+            card_media = assets.get("cardMedia") or {}
+            default_media = card_media.get("defaultMedia") or {}
             thumbnail = default_media.get("src1x", "")
 
-            offers = item.get("offers", []) or []
-            expiry = offers[0].get("endTime") if offers else None
+            offers = item.get("offers") or []
+            expiry = offers[0].get("endTime") if (offers and isinstance(offers[0], dict)) else None
 
             free.append({
                 "id": f"luna_{item.get('id', '')}",
                 "title": title,
-                "description": assets.get("shortformDescription", ""),
-                "claim_url": assets.get("externalClaimLink", ""),
+                "description": assets.get("shortformDescription") or "",
+                "claim_url": assets.get("externalClaimLink") or "",
                 "thumbnail": thumbnail,
                 "expiry": expiry,
             })
@@ -1127,7 +1154,7 @@ def _fetch_xbox_data_unlocked() -> bool:
                         list_price = price.get("ListPrice", 0.0)
                         currency = price.get("CurrencyCode", "INR")
 
-                        avail_end = avail.get("Conditions", {}).get("EndDate")
+                        avail_end = (avail.get("Conditions") or {}).get("EndDate")
 
                         # 100% Free Game Check
                         if list_price == 0 and msrp > 0:
