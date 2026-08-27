@@ -14,6 +14,7 @@ Automated tracker that checks store platforms daily for **100% free games**, **s
 | **Xbox (PC)** | ✅ | ✅ | — | Xbox Deals & Microsoft DisplayCatalog |
 | **itch.io** | ✅ | — | — | itch.io On-Sale Scraper |
 | **STOVE Store** | ✅ | — | — | OnStove Store Search API |
+| **IndieGala** | ✅ | — | — | IndieGala Freebies Showcase Scraper |
 | **Lenovo Legion Gaming** | — | — | ✅ | Legion Community Key Drops Scraper |
 
 ---
@@ -84,7 +85,7 @@ python check_games.py --list-sources
 
 The application uses three dedicated tables in PostgreSQL:
 
-- **`tracked_games`**: Stores active 100% off free games across Epic, Luna, itch.io, STOVE, Steam, and Xbox.
+- **`tracked_games`**: Stores active 100% off free games across Epic, Luna, itch.io, STOVE, IndieGala, Steam, and Xbox.
 - **`tracked_deals`**: Stores active 90%+ discount deals across Steam, Epic, and Xbox. Automatically purges entries older than 1 year.
 - **`tracked_key_drops`**: Stores claimed and active promotional key drops from Lenovo Legion.
 

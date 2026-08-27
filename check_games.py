@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, Steam, and Xbox PC free games & deals, notify via Telegram."""
+"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, and Xbox PC free games & deals, notify via Telegram."""
 
 import argparse
 import html
@@ -68,6 +68,11 @@ ITCH_USER_AGENT = (
 )
 STOVE_API_URL = "https://api.onstove.com/store/v1.0/products/search"
 STOVE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+INDIEGALA_FREEBIES_URL = "https://freebies.indiegala.com/"
+INDIEGALA_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
@@ -747,6 +752,101 @@ def get_stove_free_games(max_pages: int = STOVE_MAX_PAGES) -> list[dict] | None:
 
 
 # ---------------------------------------------------------------------------
+# IndieGala Freebies
+# ---------------------------------------------------------------------------
+
+def _fetch_indiegala_detail(link: str, headers: dict) -> str:
+    try:
+        dr = requests.get(link, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        dr.raise_for_status()
+        dsoup = BeautifulSoup(dr.text, "html.parser")
+        og_desc = dsoup.find("meta", property="og:description")
+        if og_desc and og_desc.get("content"):
+            return og_desc["content"].strip()
+        meta_desc = dsoup.find("meta", attrs={"name": "description"})
+        if meta_desc and meta_desc.get("content"):
+            return meta_desc["content"].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def get_indiegala_free_games() -> list[dict] | None:
+    headers = {"User-Agent": INDIEGALA_USER_AGENT}
+    try:
+        resp = requests.get(INDIEGALA_FREEBIES_URL, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  ⚠️ Failed to fetch IndieGala Freebies: {e}", file=sys.stderr)
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    items = soup.select("div.products-col")
+    if not items:
+        return []
+
+    raw_items = []
+    seen_ids = set()
+
+    for it in items:
+        try:
+            a = it.select_one("a.fit-click")
+            img = it.select_one("img")
+            title_el = it.select_one(".product-title")
+            title = title_el.get_text(strip=True) if title_el else (a.get("title") if a else "")
+            link = a.get("href") if a else ""
+            if not link or not title:
+                continue
+
+            slug = link.rstrip("/").split("/")[-1]
+            if not slug or slug in seen_ids:
+                continue
+            seen_ids.add(slug)
+
+            img_src = (img.get("data-img-src") or img.get("src") or "") if img else ""
+
+            raw_items.append({
+                "slug": slug,
+                "title": title,
+                "link": link,
+                "thumbnail": img_src,
+            })
+        except Exception as e:
+            print(f"  ⚠️ Skipping malformed IndieGala game entry: {e}", file=sys.stderr)
+            continue
+
+    # Fetch descriptions in parallel
+    descriptions = {}
+    with ThreadPoolExecutor(max_workers=min(len(raw_items) or 1, 6)) as pool:
+        futures = {
+            pool.submit(_fetch_indiegala_detail, it["link"], headers): it["slug"]
+            for it in raw_items
+        }
+        for fut, slug in futures.items():
+            try:
+                descriptions[slug] = fut.result()
+            except Exception:
+                descriptions[slug] = ""
+
+    free_games = []
+    for it in raw_items:
+        slug = it["slug"]
+        desc = descriptions.get(slug, "")
+        free_games.append({
+            "id": f"indiegala_{slug}",
+            "title": it["title"],
+            "description": desc,
+            "claim_url": it["link"],
+            "thumbnail": it["thumbnail"],
+            "original_price": "100% Off",
+            "currency": "USD",
+            "expiry": None,
+        })
+
+    return free_games
+
+
+# ---------------------------------------------------------------------------
 # Steam Store
 # ---------------------------------------------------------------------------
 
@@ -1397,6 +1497,20 @@ def send_telegram_stove(game: dict) -> None:
     _deliver(game.get("thumbnail", ""), message)
 
 
+def send_telegram_indiegala(game: dict) -> None:
+    desc = _truncate_desc(game.get("description", ""))
+    price_line = f"💰 Original Price: {_escape(game.get('original_price', ''))}\n" if game.get("original_price") else "💰 100% Discount (Free)\n"
+    message = (
+        f"🎮 <b>New Free Game on IndieGala! (100% Off)</b>\n\n"
+        f"<b>{_escape(game['title'])}</b>\n"
+        + (f"{desc}\n\n" if desc else "")
+        + price_line
+        + f"🎁 <b>DRM-Free Claim</b>\n\n"
+        + f"<a href='{game.get('claim_url', '')}'>Claim Freebie Now</a>"
+    )
+    _deliver(game.get("thumbnail", ""), message)
+
+
 def _generic_free_game(game: dict, store_label: str, heading: str) -> None:
     desc = _truncate_desc(game.get("description", ""))
     expires_str = _format_expiry(game.get("expiry"))
@@ -1460,16 +1574,17 @@ def send_telegram_key_drop(drop: dict, platform_name: str) -> None:
 # kind: "game" (tracked_games), "deal" (tracked_deals), "key_drop" (tracked_key_drops)
 # send_fn signature: game -> (item); deal/key_drop -> (item, store_name)
 SOURCES: list[dict[str, Any]] = [
-    {"name": "Epic Games",  "platform": "epic",   "kind": "game",     "fetch": get_epic_free_games,      "send": send_telegram_epic},
-    {"name": "Amazon Luna", "platform": "luna",   "kind": "game",     "fetch": get_luna_free_games,      "send": send_telegram_luna},
-    {"name": "itch.io",     "platform": "itch",   "kind": "game",     "fetch": get_itch_free_games,      "send": send_telegram_itch},
-    {"name": "STOVE Store", "platform": "stove",  "kind": "game",     "fetch": get_stove_free_games,     "send": send_telegram_stove},
-    {"name": "Steam",       "platform": "steam",  "kind": "game",     "fetch": get_steam_free_games,     "send": send_telegram_steam},
-    {"name": "Xbox (PC)",   "platform": "xbox",   "kind": "game",     "fetch": get_xbox_free_games,      "send": send_telegram_xbox},
-    {"name": "Steam",       "platform": "steam",  "kind": "deal",     "fetch": get_steam_discount_deals, "send": send_telegram_deal},
-    {"name": "Epic Games",  "platform": "epic",   "kind": "deal",     "fetch": get_epic_discount_deals,  "send": send_telegram_deal},
-    {"name": "Xbox (PC)",   "platform": "xbox",   "kind": "deal",     "fetch": get_xbox_discount_deals,  "send": send_telegram_deal},
-    {"name": "Lenovo Legion", "platform": "lenovo", "kind": "key_drop", "fetch": get_lenovo_key_drops,   "send": send_telegram_key_drop},
+    {"name": "Epic Games",    "platform": "epic",      "kind": "game",     "fetch": get_epic_free_games,      "send": send_telegram_epic},
+    {"name": "Amazon Luna",   "platform": "luna",      "kind": "game",     "fetch": get_luna_free_games,      "send": send_telegram_luna},
+    {"name": "itch.io",       "platform": "itch",      "kind": "game",     "fetch": get_itch_free_games,      "send": send_telegram_itch},
+    {"name": "STOVE Store",   "platform": "stove",     "kind": "game",     "fetch": get_stove_free_games,     "send": send_telegram_stove},
+    {"name": "IndieGala",     "platform": "indiegala", "kind": "game",     "fetch": get_indiegala_free_games, "send": send_telegram_indiegala},
+    {"name": "Steam",         "platform": "steam",     "kind": "game",     "fetch": get_steam_free_games,     "send": send_telegram_steam},
+    {"name": "Xbox (PC)",     "platform": "xbox",      "kind": "game",     "fetch": get_xbox_free_games,      "send": send_telegram_xbox},
+    {"name": "Steam",         "platform": "steam",     "kind": "deal",     "fetch": get_steam_discount_deals, "send": send_telegram_deal},
+    {"name": "Epic Games",    "platform": "epic",      "kind": "deal",     "fetch": get_epic_discount_deals,  "send": send_telegram_deal},
+    {"name": "Xbox (PC)",     "platform": "xbox",      "kind": "deal",     "fetch": get_xbox_discount_deals,  "send": send_telegram_deal},
+    {"name": "Lenovo Legion", "platform": "lenovo",    "kind": "key_drop", "fetch": get_lenovo_key_drops,   "send": send_telegram_key_drop},
 ]
 
 # ---------------------------------------------------------------------------
@@ -1613,7 +1728,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="PLATFORM",
-        help="Only check the given platform (repeatable): epic, luna, itch, stove, steam, xbox, lenovo.",
+        help="Only check the given platform (repeatable): epic, luna, itch, stove, indiegala, steam, xbox, lenovo.",
     )
     parser.add_argument(
         "--list-sources",
