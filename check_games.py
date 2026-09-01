@@ -226,7 +226,6 @@ def _fetch_epic_data_unlocked() -> bool:
         return True
 
     now = datetime.now(timezone.utc)
-    month_prefix = now.strftime("%Y_%m")
     free_games = []
     discount_deals = []
     seen_free = set()
@@ -431,7 +430,7 @@ def _fetch_epic_data_unlocked() -> bool:
                             if game_id not in seen_deals:
                                 seen_deals.add(game_id)
                                 discount_deals.append({
-                                    "id": f"epic_deal_{month_prefix}_{game_id}",
+                                    "id": f"epic_deal_{game_id}",
                                     "title": el.get("title", "Unknown Game"),
                                     "description": el.get("description") or "",
                                     "claim_url": claim_url,
@@ -1005,9 +1004,8 @@ def get_steam_discount_deals(max_pages: int = MAX_STEAM_DEAL_PAGES) -> list[dict
                         thumbnail = f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg"
                         claim_url = f"https://store.steampowered.com/app/{appid}/"
 
-                        month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
                         deals.append({
-                            "id": f"steam_deal_{month_prefix}_{appid}",
+                            "id": f"steam_deal_{appid}",
                             "title": title,
                             "description": "",
                             "claim_url": claim_url,
@@ -1195,7 +1193,6 @@ def _fetch_xbox_data_unlocked() -> bool:
     discount_deals = []
     seen_free = set()
     seen_deals = set()
-    month_prefix = datetime.now(timezone.utc).strftime("%Y_%m")
 
     def fetch_chunk_products(chunk: list[str]) -> list[dict]:
         params = {
@@ -1280,7 +1277,7 @@ def _fetch_xbox_data_unlocked() -> bool:
                                     orig_str = f"₹{msrp:.2f}" if currency == "INR" else f"{currency} {msrp}"
                                     disc_str = f"₹{list_price:.2f}" if currency == "INR" else f"{currency} {list_price}"
                                     discount_deals.append({
-                                        "id": f"xbox_deal_{month_prefix}_{pid}",
+                                        "id": f"xbox_deal_{pid}",
                                         "title": title,
                                         "description": desc,
                                         "claim_url": claim_url,

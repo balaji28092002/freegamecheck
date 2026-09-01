@@ -127,6 +127,27 @@ DELETE FROM tracked_deals
 WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '1 year';
 """
 
+MIGRATE_DEAL_IDS_SQL = """
+-- Remove older duplicate monthly records for the same game
+DELETE FROM tracked_deals a
+USING tracked_deals b
+WHERE a.id ~ '^[a-z]+_deal_\\d{4}_\\d{2}_'
+  AND b.id ~ '^[a-z]+_deal_\\d{4}_\\d{2}_'
+  AND regexp_replace(a.id, '^([a-z]+_deal_)\\d{4}_\\d{2}_(.*)$', '\\1\\2') = regexp_replace(b.id, '^([a-z]+_deal_)\\d{4}_\\d{2}_(.*)$', '\\1\\2')
+  AND (a.updated_at < b.updated_at OR (a.updated_at = b.updated_at AND a.id < b.id));
+
+-- Remove old monthly records if the clean ID already exists
+DELETE FROM tracked_deals a
+USING tracked_deals b
+WHERE a.id ~ '^[a-z]+_deal_\\d{4}_\\d{2}_'
+  AND regexp_replace(a.id, '^([a-z]+_deal_)\\d{4}_\\d{2}_(.*)$', '\\1\\2') = b.id;
+
+-- Strip YYYY_MM_ date prefixes from all remaining deal IDs
+UPDATE tracked_deals
+SET id = regexp_replace(id, '^([a-z]+_deal_)\\d{4}_\\d{2}_(.*)$', '\\1\\2')
+WHERE id ~ '^[a-z]+_deal_\\d{4}_\\d{2}_';
+"""
+
 # The connection is shared for the whole run; a lock serializes access because
 # source checks run concurrently in threads and psycopg2 connections are not thread-safe.
 _DB_LOCK = threading.Lock()
@@ -224,6 +245,7 @@ def init_db() -> None:
             cur.execute(CREATE_DEALS_TABLE_SQL)
             cur.execute(CREATE_KEY_DROPS_TABLE_SQL)
             cur.execute(PURGE_OLD_DEALS_SQL)
+            cur.execute(MIGRATE_DEAL_IDS_SQL)
         _db_initialized = True
 
     _execute_with_retry("initialize database", _query)
