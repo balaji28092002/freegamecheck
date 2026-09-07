@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, and Xbox PC free games & deals, notify via Telegram."""
+"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, Xbox PC, and GOG free games & deals, notify via Telegram."""
 
 import argparse
 import html
@@ -92,6 +92,15 @@ LENOVO_KEY_DROPS_URL = "https://gaming.lenovo.com/game-key-drops"
 XBOX_SALES_URL = "https://www.xbox.com/en-in/promotions/sales/sales-and-specials?xr=shellnav"
 XBOX_CATALOG_URL = "https://displaycatalog.mp.microsoft.com/v7.0/products"
 XBOX_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+GOG_SECTIONS_PAGE_URL = (
+    "https://sections.gog.com/v1/pages/2f?countryCode=US&locale=en-US&currencyCode=USD"
+)
+GOG_SECTIONS_BASE_URL = "https://sections.gog.com/v1/pages/2f/sections"
+GOG_HOME_URL = "https://www.gog.com/en/"
+GOG_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
@@ -1311,8 +1320,145 @@ def get_xbox_discount_deals() -> list[dict] | None:
 
 
 # ---------------------------------------------------------------------------
+# GOG Store
+# ---------------------------------------------------------------------------
+
+def get_gog_free_games() -> list[dict] | None:
+    """Fetch active limited-time giveaway games on GOG."""
+    headers = {"User-Agent": GOG_USER_AGENT}
+    free_games = []
+    seen_ids = set()
+    api_or_scrape_succeeded = False
+
+    # 1. Check GOG Homepage Giveaway Section via sections.gog.com API
+    giveaway_section_id = None
+    try:
+        resp = requests.get(GOG_SECTIONS_PAGE_URL, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            api_or_scrape_succeeded = True
+            data = resp.json()
+            for sec in data.get("sections", []):
+                if sec.get("sectionType") == "GIVEAWAY_SECTION":
+                    giveaway_section_id = sec.get("sectionId")
+                    break
+    except Exception as e:
+        print(f"  ⚠️ Warning: Failed to query GOG sections list: {e}", file=sys.stderr)
+
+    # If giveaway section ID found via API, fetch its details
+    if giveaway_section_id:
+        try:
+            sec_url = f"{GOG_SECTIONS_BASE_URL}/{giveaway_section_id}?countryCode=US&locale=en-US&currencyCode=USD"
+            sec_resp = requests.get(sec_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+            if sec_resp.status_code == 200:
+                sec_data = sec_resp.json()
+                props = sec_data.get("properties", {})
+                product = props.get("product", {})
+                end_date = props.get("endDate")
+                prod_id = product.get("id")
+                slug = product.get("slug")
+                title = product.get("title")
+
+                if prod_id and title:
+                    claim_url = f"https://www.gog.com/en/game/{slug}" if slug else "https://www.gog.com/en/#giveaway"
+                    thumbnail = product.get("coverHorizontal") or product.get("coverVertical") or ""
+
+                    # Fetch extra details (description, base price)
+                    description = ""
+                    original_price = ""
+                    try:
+                        det_resp = requests.get(
+                            f"https://api.gog.com/products/{prod_id}?expand=description",
+                            headers=headers,
+                            timeout=10,
+                        )
+                        if det_resp.status_code == 200:
+                            det_data = det_resp.json()
+                            lead = det_data.get("description", {}).get("lead", "")
+                            lead_clean = re.sub(r"<[^>]+>", " ", lead).strip()
+                            description = " ".join(lead_clean.split())
+                    except Exception:
+                        pass
+
+                    try:
+                        cat_resp = requests.get(
+                            f"https://catalog.gog.com/v1/catalog?query=like:{title}&currencyCode=USD&locale=en-US",
+                            headers=headers,
+                            timeout=10,
+                        )
+                        if cat_resp.status_code == 200:
+                            for p in cat_resp.json().get("products", []):
+                                if p.get("slug") == slug or str(p.get("id")) == str(prod_id):
+                                    original_price = p.get("price", {}).get("base", "")
+                                    break
+                    except Exception:
+                        pass
+
+                    game_item = {
+                        "id": f"gog_{prod_id}",
+                        "title": title,
+                        "description": description,
+                        "claim_url": claim_url,
+                        "thumbnail": thumbnail,
+                        "original_price": original_price or "Free",
+                        "currency": "USD" if original_price else "",
+                        "expiry": end_date,
+                    }
+                    free_games.append(game_item)
+                    seen_ids.add(str(prod_id))
+        except Exception as e:
+            print(f"  ⚠️ Warning: Failed to fetch GOG giveaway section details: {e}", file=sys.stderr)
+
+    # 2. Fallback: Parse GOG homepage HTML if API didn't return any games
+    if not free_games:
+        try:
+            home_resp = requests.get(GOG_HOME_URL, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+            if home_resp.status_code == 200:
+                api_or_scrape_succeeded = True
+                soup = BeautifulSoup(home_resp.text, "html.parser")
+                giveaway_elem = soup.find(class_="giveaway")
+                if giveaway_elem:
+                    link_elem = giveaway_elem.find("a", class_="giveaway__overlay-link")
+                    claim_url = link_elem.get("href") if link_elem else "https://www.gog.com/en/#giveaway"
+                    img_elem = giveaway_elem.find("img")
+                    title = "GOG Giveaway Game"
+                    if img_elem and img_elem.get("alt"):
+                        alt_text = img_elem.get("alt").replace("giveaway", "").strip()
+                        if alt_text:
+                            title = alt_text
+
+                    thumbnail = ""
+                    source_elem = giveaway_elem.find("source")
+                    if source_elem and source_elem.get("srcset"):
+                        thumbnail = source_elem.get("srcset").split(",")[0].split()[0]
+
+                    slug_match = re.search(r"/game/([^/?#]+)", claim_url)
+                    game_id = slug_match.group(1) if slug_match else "giveaway"
+
+                    if game_id not in seen_ids:
+                        free_games.append({
+                            "id": f"gog_{game_id}",
+                            "title": title,
+                            "description": "Claim limited-time free game on GOG!",
+                            "claim_url": claim_url,
+                            "thumbnail": thumbnail,
+                            "original_price": "Free",
+                            "currency": "USD",
+                            "expiry": None,
+                        })
+                        seen_ids.add(game_id)
+        except Exception as e:
+            print(f"  ⚠️ Warning: Failed to parse GOG homepage HTML: {e}", file=sys.stderr)
+
+    if not api_or_scrape_succeeded and not free_games:
+        return None
+
+    return free_games
+
+
+# ---------------------------------------------------------------------------
 # Telegram notifications
 # ---------------------------------------------------------------------------
+
 
 def _escape(text: str) -> str:
     """Escape text for Telegram HTML parse mode."""
@@ -1440,9 +1586,10 @@ def send_telegram_no_new_games() -> None:
 
     message = (
         "ℹ️ <b>No New Free Games Today</b>\n\n"
-        "Checked Epic Games, Amazon Luna, itch.io, STOVE Store, Steam, and Xbox (PC).\n"
+        "Checked Epic Games, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, Xbox (PC), and GOG.\n"
         "There are no new currently available free games."
     )
+
     try:
         _send_text(message)
         print("  ℹ️ Sent Telegram notification: No new free games found today.")
@@ -1531,6 +1678,10 @@ def send_telegram_xbox(game: dict) -> None:
     _generic_free_game(game, "Xbox", "New Free PC Game on Xbox! (100% Off)")
 
 
+def send_telegram_gog(game: dict) -> None:
+    _generic_free_game(game, "GOG", "New Free Game on GOG! (100% Off)")
+
+
 def send_telegram_deal(deal: dict, store_name: str) -> None:
     desc = _truncate_desc(deal.get("description", ""))
     pct = _escape(deal.get("discount_pct", "90%+"))
@@ -1578,11 +1729,13 @@ SOURCES: list[dict[str, Any]] = [
     {"name": "IndieGala",     "platform": "indiegala", "kind": "game",     "fetch": get_indiegala_free_games, "send": send_telegram_indiegala},
     {"name": "Steam",         "platform": "steam",     "kind": "game",     "fetch": get_steam_free_games,     "send": send_telegram_steam},
     {"name": "Xbox (PC)",     "platform": "xbox",      "kind": "game",     "fetch": get_xbox_free_games,      "send": send_telegram_xbox},
+    {"name": "GOG",           "platform": "gog",       "kind": "game",     "fetch": get_gog_free_games,       "send": send_telegram_gog},
     {"name": "Steam",         "platform": "steam",     "kind": "deal",     "fetch": get_steam_discount_deals, "send": send_telegram_deal},
     {"name": "Epic Games",    "platform": "epic",      "kind": "deal",     "fetch": get_epic_discount_deals,  "send": send_telegram_deal},
     {"name": "Xbox (PC)",     "platform": "xbox",      "kind": "deal",     "fetch": get_xbox_discount_deals,  "send": send_telegram_deal},
     {"name": "Lenovo Legion", "platform": "lenovo",    "kind": "key_drop", "fetch": get_lenovo_key_drops,   "send": send_telegram_key_drop},
 ]
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1725,7 +1878,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="PLATFORM",
-        help="Only check the given platform (repeatable): epic, luna, itch, stove, indiegala, steam, xbox, lenovo.",
+        help="Only check the given platform (repeatable): epic, luna, itch, stove, indiegala, steam, xbox, gog, lenovo.",
     )
     parser.add_argument(
         "--list-sources",
