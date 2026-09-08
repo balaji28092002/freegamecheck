@@ -42,7 +42,8 @@ ITCH_MAX_PAGES = 5
 STOVE_MAX_PAGES = 5
 DISCOUNT_DEAL_MIN_PCT = 90         # Deals are 90%..99% off (100% handled as free games)
 DISCOUNT_DEAL_MAX_PCT = 99
-TELEGRAM_SEND_TIMEOUT = 15
+TELEGRAM_SEND_TIMEOUT = 30         # 30s allows Telegram servers sufficient time to fetch remote thumbnails
+TELEGRAM_PACE_SECONDS = 0.8        # Pacing delay between Telegram notifications to respect 1 msg/sec limit
 TELEGRAM_MAX_RETRIES = 3           # Retries on Telegram 429 (backoff: attempt * 5s)
 DESC_MAX_LEN = 200
 
@@ -1522,13 +1523,17 @@ def _post_telegram(method: str, payload: dict) -> requests.Response:
 def _send_photo(thumbnail: str, message: str) -> bool:
     if not thumbnail:
         return False
-    resp = _post_telegram("sendPhoto", {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "photo": thumbnail,
-        "caption": message,
-        "parse_mode": "HTML",
-    })
-    return resp.ok
+    try:
+        resp = _post_telegram("sendPhoto", {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "photo": thumbnail,
+            "caption": message,
+            "parse_mode": "HTML",
+        })
+        return resp.ok
+    except Exception as e:
+        print(f"  ⚠️ sendPhoto failed ({e}), falling back to text notification…", file=sys.stderr)
+        return False
 
 
 def _send_text(message: str) -> None:
@@ -1817,6 +1822,7 @@ def check_source(name: str, kind: str, fetch_fn, send_fn, platform: str, dry_run
                         send_fn(item, name)
                     print(f"  ✅ Notification sent for {item['title']}")
                     notified += 1
+                    time.sleep(TELEGRAM_PACE_SECONDS)
                 except Exception as e:
                     print(f"  ❌ Failed to send notification: {e}", file=sys.stderr)
     else:
