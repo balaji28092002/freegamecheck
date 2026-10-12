@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, Xbox PC, and GOG free games & deals, notify via Telegram."""
+"""Check Epic Games Store, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, Xbox PC, GOG, and Google Play free games & deals, notify via Telegram."""
 
 import argparse
 import html
@@ -42,6 +42,7 @@ ITCH_MAX_PAGES = 5
 STOVE_MAX_PAGES = 5
 DISCOUNT_DEAL_MIN_PCT = 90         # Deals are 90%..99% off (100% handled as free games)
 DISCOUNT_DEAL_MAX_PCT = 99
+PLAYSTORE_DEAL_MIN_PCT = 50        # Google Play deals threshold (50%..99% off)
 TELEGRAM_SEND_TIMEOUT = 30         # 30s allows Telegram servers sufficient time to fetch remote thumbnails
 TELEGRAM_PACE_SECONDS = 0.8        # Pacing delay between Telegram notifications to respect 1 msg/sec limit
 TELEGRAM_MAX_RETRIES = 3           # Retries on Telegram 429 (backoff: attempt * 5s)
@@ -102,6 +103,25 @@ GOG_SECTIONS_PAGE_URL = (
 GOG_SECTIONS_BASE_URL = "https://sections.gog.com/v1/pages/2f/sections"
 GOG_HOME_URL = "https://www.gog.com/en/"
 GOG_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+PLAYSTORE_BASE_URLS = [
+    "https://play.google.com/store/games?device=phone&hl=en_IN&gl=IN",
+    "https://play.google.com/store/games?device=tablet&hl=en_IN&gl=IN",
+    "https://play.google.com/store/games?hl=en_IN&gl=IN",
+]
+PLAYSTORE_CATEGORIES = [
+    "GAME_ACTION", "GAME_ADVENTURE", "GAME_ARCADE", "GAME_BOARD", "GAME_CARD",
+    "GAME_CASINO", "GAME_CASUAL", "GAME_EDUCATIONAL", "GAME_MUSIC", "GAME_PUZZLE",
+    "GAME_RACING", "GAME_ROLE_PLAYING", "GAME_SIMULATION", "GAME_SPORTS",
+    "GAME_STRATEGY", "GAME_TRIVIA", "GAME_WORD",
+]
+PLAYSTORE_URLS = PLAYSTORE_BASE_URLS + [
+    f"https://play.google.com/store/apps/category/{cat}?hl=en_IN&gl=IN"
+    for cat in PLAYSTORE_CATEGORIES
+]
+PLAYSTORE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
@@ -1457,6 +1477,179 @@ def get_gog_free_games() -> list[dict] | None:
 
 
 # ---------------------------------------------------------------------------
+# Google Play Store
+# ---------------------------------------------------------------------------
+
+_playstore_cache: dict[str, Any] = {"fetched": False, "free_games": [], "discount_deals": []}
+_PLAYSTORE_FETCH_LOCK = threading.Lock()
+
+
+def _fetch_playstore_app_details(package_id: str, headers: dict) -> dict[str, Any] | None:
+    """Fetch title, description, thumbnail, and current button status from app details page."""
+    url = f"https://play.google.com/store/apps/details?id={package_id}&hl=en_IN&gl=IN"
+    try:
+        resp = requests.get(url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        text = resp.text
+
+        m_title = re.search(r'<meta property="og:title" content="([^"]+)"', text)
+        raw_title = m_title.group(1) if m_title else package_id
+        title = html.unescape(re.sub(r'\s*–\s*Apps on Google Play$', '', raw_title, flags=re.IGNORECASE).strip())
+
+        m_img = re.search(r'<meta property="og:image" content="([^"]+)"', text)
+        thumbnail = m_img.group(1) if m_img else ""
+
+        m_desc = re.search(r'<meta property="og:description" content="([^"]+)"', text)
+        if not m_desc:
+            m_desc = re.search(r'<meta name="description" content="([^"]+)"', text)
+        desc = html.unescape(m_desc.group(1)) if m_desc else ""
+
+        m_btn = re.search(r'aria-label="Was\s+([^,]+),\s+now\s+reduced\s+to\s+([^"]+)"', text)
+        button_info = m_btn.groups() if m_btn else None
+
+        return {
+            "title": title,
+            "thumbnail": thumbnail,
+            "description": desc,
+            "claim_url": url,
+            "button_info": button_info,
+        }
+    except Exception as e:
+        print(f"  ⚠️ Failed to fetch Play Store details for {package_id}: {e}", file=sys.stderr)
+        return None
+
+
+def _parse_playstore_currency_and_val(price_str: str) -> tuple[float | None, str]:
+    if not price_str:
+        return None, ""
+    cleaned = price_str.replace(",", "").strip()
+    m = re.search(r'([0-9]+(?:\.[0-9]+)?)', cleaned)
+    val = float(m.group(1)) if m else None
+    curr = "INR" if ("₹" in price_str or "INR" in price_str) else ("USD" if "$" in price_str else "")
+    return val, curr
+
+
+def _fetch_playstore_data() -> bool:
+    with _PLAYSTORE_FETCH_LOCK:
+        return _fetch_playstore_data_unlocked()
+
+
+def _fetch_playstore_data_unlocked() -> bool:
+    if _playstore_cache["fetched"]:
+        return True
+
+    headers = {
+        "User-Agent": PLAYSTORE_USER_AGENT,
+        "Accept-Language": "en-IN,en;q=0.9",
+    }
+    free_games = []
+    discount_deals = []
+    seen_ids = set()
+    found_packages: dict[str, tuple[str, str]] = {}
+    any_success = False
+
+    def _crawl_single_playstore_url(page_url: str) -> dict[str, tuple[str, str]]:
+        try:
+            resp = requests.get(page_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                return {}
+            text = resp.text
+            matches = list(re.finditer(r'aria-label="Was\s+([^,]+),\s+now\s+reduced\s+to\s+([^"]+)"', text))
+            res = {}
+            for m in matches:
+                orig_raw = m.group(1).strip()
+                reduced_raw = m.group(2).strip()
+                btn_pos = m.start()
+                sub = text[:btn_pos]
+                links = list(re.finditer(r'/store/apps/details\?id=([a-zA-Z0-9_\.]+)', sub))
+                if links:
+                    pkg_id = links[-1].group(1)
+                    res[pkg_id] = (orig_raw, reduced_raw)
+            return res
+        except Exception as e:
+            print(f"  ⚠️ Failed to crawl Play Store URL {page_url}: {e}", file=sys.stderr)
+            return {}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        crawl_results = pool.map(_crawl_single_playstore_url, PLAYSTORE_URLS)
+
+    for r in crawl_results:
+        found_packages.update(r)
+
+    if not found_packages:
+        return False
+
+    for pkg_id, (orig_str, reduced_str) in found_packages.items():
+        if pkg_id in seen_ids:
+            continue
+        details = _fetch_playstore_app_details(pkg_id, headers)
+        if not details:
+            continue
+
+        btn_info = details.get("button_info")
+        if btn_info:
+            orig_str, reduced_str = btn_info
+
+        orig_val, curr = _parse_playstore_currency_and_val(orig_str)
+        reduced_lower = reduced_str.lower()
+
+        is_free = (
+            "install" in reduced_lower
+            or reduced_lower in ("free", "₹0", "₹0.00", "$0", "$0.00", "0")
+        )
+
+        game_id = f"playstore_{pkg_id}"
+        seen_ids.add(pkg_id)
+
+        if is_free:
+            free_games.append({
+                "id": game_id,
+                "title": details["title"],
+                "description": details["description"],
+                "claim_url": details["claim_url"],
+                "thumbnail": details["thumbnail"],
+                "original_price": orig_str,
+                "currency": curr or "INR",
+                "expiry": None,
+            })
+        else:
+            deal_val, _ = _parse_playstore_currency_and_val(reduced_str)
+            if orig_val and deal_val is not None and orig_val > 0:
+                pct = round(((orig_val - deal_val) / orig_val) * 100)
+                if PLAYSTORE_DEAL_MIN_PCT <= pct <= DISCOUNT_DEAL_MAX_PCT:
+                    discount_deals.append({
+                        "id": game_id,
+                        "title": details["title"],
+                        "description": details["description"],
+                        "claim_url": details["claim_url"],
+                        "thumbnail": details["thumbnail"],
+                        "original_price": orig_str,
+                        "discounted_price": reduced_str,
+                        "discount_pct": f"{pct}%",
+                        "currency": curr or "INR",
+                        "expiry": None,
+                    })
+
+    _playstore_cache["free_games"] = free_games
+    _playstore_cache["discount_deals"] = discount_deals
+    _playstore_cache["fetched"] = True
+    return True
+
+
+def get_playstore_free_games() -> list[dict[str, Any]] | None:
+    if not _fetch_playstore_data():
+        return None
+    return _playstore_cache["free_games"]
+
+
+def get_playstore_discount_deals() -> list[dict[str, Any]] | None:
+    if not _fetch_playstore_data():
+        return None
+    return _playstore_cache["discount_deals"]
+
+
+# ---------------------------------------------------------------------------
 # Telegram notifications
 # ---------------------------------------------------------------------------
 
@@ -1591,7 +1784,7 @@ def send_telegram_no_new_games() -> None:
 
     message = (
         "ℹ️ <b>No New Free Games Today</b>\n\n"
-        "Checked Epic Games, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, Xbox (PC), and GOG.\n"
+        "Checked Epic Games, Amazon Luna, itch.io, STOVE Store, IndieGala, Steam, Xbox (PC), GOG, and Google Play.\n"
         "There are no new currently available free games."
     )
 
@@ -1687,6 +1880,10 @@ def send_telegram_gog(game: dict) -> None:
     _generic_free_game(game, "GOG", "New Free Game on GOG! (100% Off)")
 
 
+def send_telegram_playstore(game: dict) -> None:
+    _generic_free_game(game, "Google Play", "New Free Game on Google Play! (100% Off)")
+
+
 def send_telegram_deal(deal: dict, store_name: str) -> None:
     desc = _truncate_desc(deal.get("description", ""))
     pct = _escape(deal.get("discount_pct", "90%+"))
@@ -1738,6 +1935,8 @@ SOURCES: list[dict[str, Any]] = [
     {"name": "Steam",         "platform": "steam",     "kind": "deal",     "fetch": get_steam_discount_deals, "send": send_telegram_deal},
     {"name": "Epic Games",    "platform": "epic",      "kind": "deal",     "fetch": get_epic_discount_deals,  "send": send_telegram_deal},
     {"name": "Xbox (PC)",     "platform": "xbox",      "kind": "deal",     "fetch": get_xbox_discount_deals,  "send": send_telegram_deal},
+    {"name": "Google Play",   "platform": "playstore", "kind": "game",     "fetch": get_playstore_free_games, "send": send_telegram_playstore},
+    {"name": "Google Play",   "platform": "playstore", "kind": "deal",     "fetch": get_playstore_discount_deals, "send": send_telegram_deal},
     {"name": "Lenovo Legion", "platform": "lenovo",    "kind": "key_drop", "fetch": get_lenovo_key_drops,   "send": send_telegram_key_drop},
 ]
 
@@ -1777,7 +1976,10 @@ def _save_items(kind: str, platform: str, items: list[dict]) -> None:
 
 def check_source(name: str, kind: str, fetch_fn, send_fn, platform: str, dry_run: bool = False) -> tuple[int, bool]:
     """Check one source; returns (notifications_sent, ok)."""
-    label = {"game": "free games", "deal": "90%+ discount deals", "key_drop": "Key Drops"}[kind]
+    if kind == "deal" and platform == "playstore":
+        label = "50%+ discount deals"
+    else:
+        label = {"game": "free games", "deal": "90%+ discount deals", "key_drop": "Key Drops"}[kind]
     print(f"\n[{datetime.now().isoformat()}] Checking {name} {label}…")
 
     known_ids = _load_known_ids(kind, platform)
@@ -1799,7 +2001,7 @@ def check_source(name: str, kind: str, fetch_fn, send_fn, platform: str, dry_run
         return 0, False
 
     if kind == "deal":
-        print(f"  Current 90%+ deals: {[d['title'] + ' (' + d['discount_pct'] + ')' for d in current]}")
+        print(f"  Current {label}: {[d['title'] + ' (' + d['discount_pct'] + ')' for d in current]}")
     else:
         print(f"  Current items: {[g['title'] for g in current]}")
 
@@ -1884,7 +2086,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="PLATFORM",
-        help="Only check the given platform (repeatable): epic, luna, itch, stove, indiegala, steam, xbox, gog, lenovo.",
+        help="Only check the given platform (repeatable): epic, luna, itch, stove, indiegala, steam, xbox, gog, lenovo, playstore.",
     )
     parser.add_argument(
         "--list-sources",
